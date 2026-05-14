@@ -1,0 +1,10 @@
+SOURCE_TYPES = ("exchange", "regulator", "news", "macro", "manual", "other")
+RUN_TYPES = ("scheduled", "manual", "backfill", "retry")
+INGESTION_RUN_STATUSES = ("running", "success", "partial_success", "failed")
+RAW_PAYLOAD_TYPES = ("json", "html", "csv", "xml", "text", "pdf_metadata", "other")
+RAW_PAYLOAD_STATUSES = ("collected", "parsed", "normalized", "failed", "ignored")
+INSTRUMENT_TYPES = ("equity", "bond", "fund", "index", "other")
+DATA_QUALITY_STATUSES = ("valid", "suspect", "stale", "missing")
+SYNC_STATUSES = ("healthy", "degraded", "failed", "unknown")
+NORMALIZATION_ERROR_STATUSES = ("open", "ignored", "fixed")
+
