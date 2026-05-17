@@ -16,6 +16,47 @@ def get_raw_payload_by_hash(db: Session, *, source_id, payload_hash: str) -> Raw
     )
 
 
+def get_raw_payload_by_id(db: Session, raw_payload_id) -> RawPayload | None:
+    return db.get(RawPayload, raw_payload_id)
+
+
+def list_eligible_raw_payloads(
+    db: Session,
+    *,
+    payload_type: str,
+    status: str = "collected",
+    limit: int = 10,
+) -> list[RawPayload]:
+    return list(
+        db.scalars(
+            select(RawPayload)
+            .where(
+                RawPayload.payload_type == payload_type,
+                RawPayload.status == status,
+                RawPayload.payload_text.is_not(None),
+            )
+            .order_by(RawPayload.collected_at.asc(), RawPayload.created_at.asc())
+            .limit(limit)
+        )
+    )
+
+
+def update_raw_payload_status(
+    db: Session,
+    raw_payload: RawPayload,
+    *,
+    status: str,
+    error_message: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> RawPayload:
+    raw_payload.status = status
+    raw_payload.error_message = error_message
+    if metadata:
+        raw_payload.metadata_ = {**(raw_payload.metadata_ or {}), **metadata}
+    db.flush()
+    return raw_payload
+
+
 def insert_raw_payload_if_new(
     db: Session,
     *,
@@ -59,4 +100,3 @@ def insert_raw_payload_if_new(
     db.add(raw_payload)
     db.flush()
     return raw_payload, True
-

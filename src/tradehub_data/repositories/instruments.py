@@ -21,3 +21,26 @@ def get_instrument_by_isin(db: Session, *, exchange_id, isin: str) -> Instrument
         )
     )
 
+
+def upsert_instrument(db: Session, values: dict) -> tuple[Instrument, bool, bool]:
+    isin = values.get("isin")
+    symbol = values["symbol"]
+    exchange_id = values["exchange_id"]
+
+    instrument = get_instrument_by_isin(db, exchange_id=exchange_id, isin=isin) if isin else None
+    if instrument is None:
+        instrument = get_instrument_by_symbol(db, exchange_id=exchange_id, symbol=symbol)
+
+    if instrument is None:
+        instrument = Instrument(**values)
+        db.add(instrument)
+        db.flush()
+        return instrument, True, False
+
+    changed = False
+    for key, value in values.items():
+        if getattr(instrument, key) != value:
+            setattr(instrument, key, value)
+            changed = True
+    db.flush()
+    return instrument, False, changed
