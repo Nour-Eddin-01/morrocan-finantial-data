@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
-from tradehub_data.collectors.bvc_prices.constants import BVC_PRICE_PAYLOAD_TYPE
+from tradehub_data.collectors.bvc_prices.constants import BVC_PRICE_JSON_SOURCE_ENDPOINT, BVC_PRICE_PAYLOAD_TYPE
 from tradehub_data.core.config import get_settings
 from tradehub_data.core.logging import configure_logging
 from tradehub_data.db.session import SessionLocal
@@ -18,7 +18,8 @@ from tradehub_data.normalizers.bvc_prices.models import BvcPriceNormalizationRes
 from tradehub_data.normalizers.bvc_prices.validation import validate_row
 from tradehub_data.parsers.bvc_prices.errors import BvcPriceParseError
 from tradehub_data.parsers.bvc_prices.html_parser import parse_bvc_market_listing_html
-from tradehub_data.parsers.bvc_prices.models import BvcParsedPriceRow
+from tradehub_data.parsers.bvc_prices.json_parser import parse_bvc_market_listing_json
+from tradehub_data.parsers.bvc_prices.models import BvcParsedPriceRow, BvcPriceParseResult
 from tradehub_data.repositories.exchanges import get_or_create_exchange
 from tradehub_data.repositories.instruments import upsert_instrument
 from tradehub_data.repositories.normalization_errors import create_normalization_error
@@ -38,12 +39,7 @@ class BvcPriceNormalizer:
             return self._fail_payload(raw_payload, "missing payload_text")
 
         try:
-            parse_result = parse_bvc_market_listing_html(
-                raw_payload_id=raw_payload.id,
-                payload_text=raw_payload.payload_text,
-                collected_at=raw_payload.collected_at,
-                source_published_at=raw_payload.source_published_at,
-            )
+            parse_result = self._parse_payload(raw_payload)
         except BvcPriceParseError as exc:
             return self._fail_payload(raw_payload, str(exc), error_type="unexpected_table_shape")
 
@@ -317,6 +313,21 @@ class BvcPriceNormalizer:
         self.db.commit()
         return result
 
+    def _parse_payload(self, raw_payload: RawPayload) -> BvcPriceParseResult:
+        if _is_json_raw_payload(raw_payload):
+            return parse_bvc_market_listing_json(
+                raw_payload_id=raw_payload.id,
+                payload_text=raw_payload.payload_text or "",
+                collected_at=raw_payload.collected_at,
+                source_published_at=raw_payload.source_published_at,
+            )
+        return parse_bvc_market_listing_html(
+            raw_payload_id=raw_payload.id,
+            payload_text=raw_payload.payload_text or "",
+            collected_at=raw_payload.collected_at,
+            source_published_at=raw_payload.source_published_at,
+        )
+
     def _record_error(
         self,
         raw_payload: RawPayload,
@@ -391,6 +402,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--raw-payload-id")
     return parser
+
+
+def _is_json_raw_payload(raw_payload: RawPayload) -> bool:
+    content_type = (raw_payload.content_type or "").lower()
+    if "json" in content_type:
+        return True
+    if raw_payload.source_endpoint == BVC_PRICE_JSON_SOURCE_ENDPOINT:
+        return True
+    if (raw_payload.metadata_ or {}).get("collection_mode") == "live_json":
+        return True
+    return bool(raw_payload.payload_text and raw_payload.payload_text.lstrip().startswith("{"))
 
 
 def main() -> None:

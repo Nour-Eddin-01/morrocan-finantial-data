@@ -1,10 +1,11 @@
 from datetime import UTC, datetime
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
 from tradehub_data.collectors.bvc_prices.constants import BVC_PRICE_PAYLOAD_TYPE
 from tradehub_data.models import DataSource, RawPayload
-from tradehub_data.parsers.bvc_prices.diagnostics import diagnose_bvc_market_listing_html, diagnose_file, diagnose_raw_payload
+from tradehub_data.parsers.bvc_prices.diagnostics import diagnose_bvc_market_listing_html, diagnose_bvc_price_payload, diagnose_file, diagnose_raw_payload
 from tradehub_data.repositories.raw_payloads import insert_raw_payload_if_new
 
 
@@ -24,8 +25,60 @@ def test_bvc_diagnostics_reports_sample_fixture_fields():
     assert result.candidate_tables[0].selected is True
 
 
+def test_bvc_json_diagnostics_reports_rows_and_mapped_fields():
+    payload = json.dumps(
+        {
+            "data": {
+                "data": [
+                    {
+                        "type": "market_watch",
+                        "id": "ABC",
+                        "attributes": {
+                            "code": "ABC-token",
+                            "lastTradedPrice": "123.4500000000",
+                            "openingPrice": "120.0000000000",
+                            "highPrice": "125.0000000000",
+                            "lowPrice": "119.0000000000",
+                            "staticReferencePrice": "121.0000000000",
+                            "varVeille": "1.2300000000",
+                            "cumulTitresEchanges": "1000.0000000000",
+                            "cumulVolumeEchange": "123450.0000000000",
+                            "capitalisation": "999999.0000000000",
+                            "totalTrades": 7,
+                            "transactTime": "2026-05-18T16:00:00+00:00",
+                            "unhandledSourceField": "kept visible",
+                        },
+                    }
+                ]
+            }
+        }
+    )
+
+    result = diagnose_bvc_price_payload(
+        payload_text=payload,
+        content_type="application/json",
+        metadata={"page_number": 1, "page_offset": 0, "page_limit": 50},
+    )
+
+    assert result.payload_format == "json"
+    assert result.status == "success"
+    assert result.tables_found == 0
+    assert result.rows_detected == 1
+    assert result.parseable_rows_count == 1
+    assert result.row_parse_errors_count == 0
+    assert "last_price" in result.mapped_fields
+    assert "volume" in result.mapped_fields
+    assert "traded_value" in result.mapped_fields
+    assert "unhandledSourceField" in result.unmapped_fields
+    assert result.source_trading_date.isoformat() == "2026-05-18"
+    assert result.source_timestamp.isoformat() == "2026-05-18T16:00:00+00:00"
+    assert result.page_number == 1
+    assert result.page_offset == 0
+    assert result.page_limit == 50
+
+
 def test_bvc_diagnostics_reports_real_fixture_mapping():
-    result = diagnose_file(Path("fixtures/bvc_prices/real/bvc_market_listing_20260515_1200.html"))
+    result = diagnose_file(Path("fixtures/bvc_prices/real/bvc_market_listing_20260518_page_1.html"))
 
     assert result.status == "success"
     assert result.tables_found == 1
@@ -33,6 +86,7 @@ def test_bvc_diagnostics_reports_real_fixture_mapping():
     assert result.rows_detected == 50
     assert result.parseable_rows_count == 50
     assert result.row_parse_errors_count == 0
+    assert result.source_trading_date.isoformat() == "2026-05-18"
     assert result.pagination_detected is True
     assert "possible_incomplete_listing" in result.pagination_warnings
     assert "volume" in result.mapped_fields

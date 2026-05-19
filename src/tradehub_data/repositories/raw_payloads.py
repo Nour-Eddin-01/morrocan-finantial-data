@@ -57,6 +57,16 @@ def update_raw_payload_status(
     return raw_payload
 
 
+def update_raw_payload_metadata(
+    db: Session,
+    raw_payload: RawPayload,
+    metadata: dict[str, Any],
+) -> RawPayload:
+    raw_payload.metadata_ = {**(raw_payload.metadata_ or {}), **metadata}
+    db.flush()
+    return raw_payload
+
+
 def insert_raw_payload_if_new(
     db: Session,
     *,

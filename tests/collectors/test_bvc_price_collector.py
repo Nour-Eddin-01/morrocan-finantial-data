@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime
 
 import httpx
@@ -6,7 +7,7 @@ import httpx
 from tradehub_data.collectors.bvc_prices.client import BvcPriceClient
 from tradehub_data.collectors.bvc_prices.collector import BvcPriceCollector
 from tradehub_data.collectors.bvc_prices.config import BvcPriceCollectorConfig
-from tradehub_data.collectors.bvc_prices.constants import BVC_PRICE_COLLECTOR_NAME, BVC_PRICE_SOURCE_CODE
+from tradehub_data.collectors.bvc_prices.constants import BVC_PRICE_COLLECTOR_NAME, BVC_PRICE_JSON_SOURCE_ENDPOINT, BVC_PRICE_SOURCE_CODE
 from tradehub_data.collectors.bvc_prices.errors import BvcFetchError
 from tradehub_data.collectors.bvc_prices.fixtures import store_local_fixture
 from tradehub_data.core.hashing import sha256_source_payload, sha256_text
@@ -31,6 +32,34 @@ def make_config(**overrides) -> BvcPriceCollectorConfig:
     }
     values.update(overrides)
     return BvcPriceCollectorConfig(**values)
+
+
+def make_json_payload(count: int, *, prefix: str = "SYM") -> str:
+    rows = []
+    for index in range(count):
+        symbol = f"{prefix}{index:03d}"
+        rows.append(
+            {
+                "type": "market_watch",
+                "id": symbol,
+                "attributes": {
+                    "code": f"{symbol}-token",
+                    "lastTradedPrice": "123.4500000000",
+                    "openingPrice": "120.0000000000",
+                    "highPrice": "125.0000000000",
+                    "lowPrice": "119.0000000000",
+                    "staticReferencePrice": "121.0000000000",
+                    "varVeille": "1.2300000000",
+                    "difference": "1.5000000000",
+                    "cumulTitresEchanges": "1000.0000000000",
+                    "cumulVolumeEchange": "123450.0000000000",
+                    "capitalisation": "999999.0000000000",
+                    "totalTrades": 7,
+                    "transactTime": "2026-05-18T16:00:00+00:00",
+                },
+            }
+        )
+    return json.dumps({"data": {"data": rows}})
 
 
 def test_hashing_is_stable_and_normalizes_line_endings():
@@ -60,6 +89,29 @@ def test_client_fetch_success_captures_response_metadata():
     assert result.body_text == "<html>prix</html>"
     assert result.source_url == "https://www.casablanca-bourse.com/prices"
     assert result.fetched_at.tzinfo is not None
+
+
+def test_client_fetch_supports_json_endpoint_headers():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["accept"] == "application/vnd.api+json"
+        assert request.headers["referer"] == "https://www.casablanca-bourse.com/fr/live-market/marche-actions-listing"
+        assert request.headers["accept-language"] == "fr-FR,fr;q=0.9,en;q=0.8"
+        return httpx.Response(200, headers={"content-type": "application/json"}, text=make_json_payload(1), request=request)
+
+    client = BvcPriceClient(make_config(), transport=httpx.MockTransport(handler))
+
+    result = run_async(
+        client.fetch(
+            "https://www.casablanca-bourse.com/api/proxy/fr/api/bourse_data/last_market_watches/action?page%5Blimit%5D=50&page%5Boffset%5D=0",
+            headers={
+                "Accept": "application/vnd.api+json",
+                "Referer": "https://www.casablanca-bourse.com/fr/live-market/marche-actions-listing",
+                "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            },
+        )
+    )
+
+    assert result.content_type == "application/json"
 
 
 def test_client_retries_temporary_http_status():
@@ -246,6 +298,106 @@ def test_config_source_urls_override_source_paths(monkeypatch):
         "https://www.casablanca-bourse.com/fr/live-market/marche-actions-listing?amp=1",
         "https://www.casablanca-bourse.com/fr/live-market/instruments/BCP",
     ]
+
+
+def test_config_defaults_to_json_endpoint(monkeypatch):
+    monkeypatch.delenv("BVC_PRICE_COLLECTOR_JSON_PATH", raising=False)
+    monkeypatch.delenv("BVC_PRICE_COLLECTOR_PAGE_LIMIT", raising=False)
+    monkeypatch.delenv("BVC_PRICE_COLLECTOR_MAX_PAGES", raising=False)
+    monkeypatch.delenv("BVC_PRICE_COLLECTOR_ACCEPT_LANGUAGE", raising=False)
+
+    config = BvcPriceCollectorConfig.from_env()
+
+    assert config.json_enabled is True
+    assert config.json_endpoint_base_url == "https://www.casablanca-bourse.com/api/proxy/fr/api/bourse_data/last_market_watches/action"
+    assert config.json_page_limit == 50
+    assert config.json_max_pages == 5
+    assert config.accept_language == "fr-FR,fr;q=0.9,en;q=0.8"
+
+
+def test_config_accept_language_supports_env_override(monkeypatch):
+    monkeypatch.setenv("BVC_PRICE_COLLECTOR_ACCEPT_LANGUAGE", "fr-MA,fr;q=0.8,en;q=0.5")
+
+    config = BvcPriceCollectorConfig.from_env()
+
+    assert config.accept_language == "fr-MA,fr;q=0.8,en;q=0.5"
+
+
+def test_json_collector_stores_paginated_raw_payloads_and_stops_on_short_page(db_session):
+    requested_offsets = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_offsets.append(request.url.params["page[offset]"])
+        assert request.headers["accept"] == "application/vnd.api+json"
+        assert request.headers["referer"] == "https://www.casablanca-bourse.com/fr/live-market/marche-actions-listing"
+        assert request.headers["accept-language"] == "fr-FR,fr;q=0.9,en;q=0.8"
+        count = 50 if request.url.params["page[offset]"] == "0" else 30
+        return httpx.Response(200, headers={"content-type": "application/json"}, text=make_json_payload(count), request=request)
+
+    config = make_config(json_page_limit=50, json_max_pages=5)
+    collector = BvcPriceCollector(db=db_session, config=config, client=BvcPriceClient(config, transport=httpx.MockTransport(handler)))
+
+    result = run_async(collector.run_json_pages())
+
+    assert result.status == "success"
+    assert result.payloads_stored == 2
+    assert requested_offsets == ["0", "50"]
+
+    raw_payloads = db_session.query(RawPayload).order_by(RawPayload.source_url).all()
+    assert {payload.source_endpoint for payload in raw_payloads} == {BVC_PRICE_JSON_SOURCE_ENDPOINT}
+    assert {payload.content_type for payload in raw_payloads} == {"application/json"}
+    assert {payload.metadata_["collection_mode"] for payload in raw_payloads} == {"live_json"}
+    assert {payload.metadata_["page_limit"] for payload in raw_payloads} == {50}
+    assert {payload.metadata_["page_offset"] for payload in raw_payloads} == {0, 50}
+    assert {payload.metadata_["page_number"] for payload in raw_payloads} == {1, 2}
+    assert {payload.metadata_["pagination_group_id"] for payload in raw_payloads}
+    assert db_session.query(IngestionRun).one().metadata_["pagination_stop_reason"] == "short_page"
+
+
+def test_json_collector_stops_on_empty_page(db_session):
+    def handler(request: httpx.Request) -> httpx.Response:
+        count = 50 if request.url.params["page[offset]"] == "0" else 0
+        return httpx.Response(200, headers={"content-type": "application/json"}, text=make_json_payload(count), request=request)
+
+    config = make_config(json_page_limit=50, json_max_pages=5)
+    collector = BvcPriceCollector(db=db_session, config=config, client=BvcPriceClient(config, transport=httpx.MockTransport(handler)))
+
+    result = run_async(collector.run_json_pages())
+
+    assert result.status == "success"
+    assert result.payloads_stored == 1
+    assert db_session.query(IngestionRun).one().metadata_["pagination_stop_reason"] == "empty_page"
+
+
+def test_json_collector_respects_max_pages(db_session):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/json"}, text=make_json_payload(50), request=request)
+
+    config = make_config(json_page_limit=50, json_max_pages=2)
+    collector = BvcPriceCollector(db=db_session, config=config, client=BvcPriceClient(config, transport=httpx.MockTransport(handler)))
+
+    result = run_async(collector.run_json_pages())
+
+    assert result.status == "success"
+    assert result.source_urls_count == 2
+    assert db_session.query(RawPayload).count() == 2
+    assert db_session.query(IngestionRun).one().metadata_["pagination_stop_reason"] == "max_pages"
+
+
+def test_json_collector_records_ssl_failure_clearly(db_session):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed", request=request)
+
+    config = make_config(max_retries=0)
+    collector = BvcPriceCollector(db=db_session, config=config, client=BvcPriceClient(config, transport=httpx.MockTransport(handler)))
+
+    result = run_async(collector.run_json_pages())
+
+    assert result.status == "failed"
+    assert result.errors_count == 1
+    run = db_session.query(IngestionRun).one()
+    assert run.metadata_["failed_urls"][0]["error_type"] == "ssl_certificate_error"
+    assert "BVC_PRICE_COLLECTOR_CA_BUNDLE_PATH" in run.metadata_["failed_urls"][0]["error"]
 
 
 def test_store_local_fixture_creates_raw_payload(db_session, tmp_path):

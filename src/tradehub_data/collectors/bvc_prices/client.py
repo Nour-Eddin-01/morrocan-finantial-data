@@ -19,11 +19,13 @@ class BvcPriceClient:
         self.config = config
         self.transport = transport
 
-    async def fetch(self, source_url: str) -> BvcFetchResult:
-        headers = {"User-Agent": self.config.user_agent}
+    async def fetch(self, source_url: str, *, headers: dict[str, str] | None = None) -> BvcFetchResult:
+        request_headers = {"User-Agent": self.config.user_agent}
+        if headers:
+            request_headers.update(headers)
         async with httpx.AsyncClient(
             timeout=self.config.timeout_seconds,
-            headers=headers,
+            headers=request_headers,
             follow_redirects=True,
             verify=self._verify_setting(),
             transport=self.transport,

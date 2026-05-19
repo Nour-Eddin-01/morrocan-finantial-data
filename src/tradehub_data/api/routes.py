@@ -5,8 +5,10 @@ from sqlalchemy.orm import Session
 
 from tradehub_data.core.config import Settings, get_settings
 from tradehub_data.db.session import get_db
+from tradehub_data.api.bvc_market import router as bvc_market_router
 
 router = APIRouter()
+router.include_router(bvc_market_router)
 
 
 @router.get("/health")

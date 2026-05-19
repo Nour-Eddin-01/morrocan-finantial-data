@@ -11,6 +11,13 @@ from pydantic import BaseModel, Field
 from tradehub_data.db.session import SessionLocal
 from tradehub_data.parsers.bvc_prices.errors import BvcPriceParseError
 from tradehub_data.parsers.bvc_prices.html_parser import MINIMUM_TABLE_FIELDS, _map_headers, _parse_row, _raw_values_from_row
+from tradehub_data.parsers.bvc_prices.json_parser import (
+    HANDLED_JSON_KEYS,
+    JSON_FIELD_ALIASES,
+    extract_json_pagination_metadata,
+    json_payload_shape,
+    parse_bvc_market_listing_json,
+)
 from tradehub_data.parsers.bvc_prices.number_parsing import clean_text, normalize_label
 from tradehub_data.parsers.bvc_prices.source_metadata import detect_pagination, extract_source_date_info
 from tradehub_data.repositories.raw_payloads import get_raw_payload_by_id
@@ -38,6 +45,7 @@ class BvcTableDiagnostic(BaseModel):
 
 
 class BvcParserDiagnosticResult(BaseModel):
+    payload_format: str = "html"
     file_path: str | None = None
     raw_payload_id: UUID | None = None
     payload_hash: str | None = None
@@ -48,6 +56,7 @@ class BvcParserDiagnosticResult(BaseModel):
     rows_detected: int = 0
     mapped_fields: list[str] = Field(default_factory=list)
     unmapped_headers: list[str] = Field(default_factory=list)
+    unmapped_fields: list[str] = Field(default_factory=list)
     missing_required_fields: list[str] = Field(default_factory=list)
     parseable_rows_count: int = 0
     row_parse_errors_count: int = 0
@@ -62,6 +71,9 @@ class BvcParserDiagnosticResult(BaseModel):
     pagination_detected: bool = False
     pagination_controls: dict[str, Any] = Field(default_factory=dict)
     pagination_warnings: list[str] = Field(default_factory=list)
+    page_number: int | None = None
+    page_offset: int | None = None
+    page_limit: int | None = None
     status: str
 
 
@@ -179,7 +191,7 @@ def diagnose_bvc_market_listing_html(
 
 
 def diagnose_file(file_path: Path) -> BvcParserDiagnosticResult:
-    return diagnose_bvc_market_listing_html(
+    return diagnose_bvc_price_payload(
         payload_text=file_path.read_text(encoding="utf-8"),
         file_path=str(file_path),
     )
@@ -192,13 +204,130 @@ def diagnose_raw_payload(raw_payload_id: UUID) -> BvcParserDiagnosticResult:
             raise SystemExit(f"raw payload not found: {raw_payload_id}")
         if not raw_payload.payload_text:
             raise SystemExit(f"raw payload has no payload_text: {raw_payload_id}")
-        return diagnose_bvc_market_listing_html(
+        return diagnose_bvc_price_payload(
             raw_payload_id=raw_payload.id,
             payload_text=raw_payload.payload_text,
             payload_hash=raw_payload.payload_hash,
             collected_at=raw_payload.collected_at,
             source_published_at=raw_payload.source_published_at,
+            content_type=raw_payload.content_type,
+            source_endpoint=raw_payload.source_endpoint,
+            metadata=raw_payload.metadata_,
         )
+
+
+def diagnose_bvc_price_payload(
+    *,
+    payload_text: str,
+    raw_payload_id: UUID | None = None,
+    file_path: str | None = None,
+    payload_hash: str | None = None,
+    collected_at: datetime | None = None,
+    source_published_at: datetime | None = None,
+    content_type: str | None = None,
+    source_endpoint: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> BvcParserDiagnosticResult:
+    if _is_json_payload(payload_text, content_type=content_type, source_endpoint=source_endpoint, metadata=metadata):
+        return diagnose_bvc_market_listing_json(
+            payload_text=payload_text,
+            raw_payload_id=raw_payload_id,
+            file_path=file_path,
+            payload_hash=payload_hash,
+            collected_at=collected_at,
+            source_published_at=source_published_at,
+            metadata=metadata,
+        )
+    return diagnose_bvc_market_listing_html(
+        payload_text=payload_text,
+        raw_payload_id=raw_payload_id,
+        file_path=file_path,
+        payload_hash=payload_hash,
+        collected_at=collected_at,
+        source_published_at=source_published_at,
+    )
+
+
+def diagnose_bvc_market_listing_json(
+    *,
+    payload_text: str,
+    raw_payload_id: UUID | None = None,
+    file_path: str | None = None,
+    payload_hash: str | None = None,
+    collected_at: datetime | None = None,
+    source_published_at: datetime | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> BvcParserDiagnosticResult:
+    diagnostic_payload_id = raw_payload_id or uuid4()
+    fallback_timestamp = source_published_at or collected_at or datetime.now(UTC)
+    try:
+        records, attribute_keys = json_payload_shape(payload_text)
+        parse_result = parse_bvc_market_listing_json(
+            raw_payload_id=diagnostic_payload_id,
+            payload_text=payload_text,
+            collected_at=fallback_timestamp,
+            source_published_at=source_published_at,
+        )
+        payload = json.loads(payload_text)
+        pagination = extract_json_pagination_metadata(payload, rows_detected=len(records))
+    except (json.JSONDecodeError, BvcPriceParseError) as exc:
+        return BvcParserDiagnosticResult(
+            payload_format="json",
+            file_path=file_path,
+            raw_payload_id=raw_payload_id,
+            payload_hash=payload_hash,
+            tables_found=0,
+            rows_detected=0,
+            mapped_fields=[],
+            unmapped_fields=[],
+            missing_required_fields=sorted(MINIMUM_TABLE_FIELDS),
+            parseable_rows_count=0,
+            row_parse_errors_count=1,
+            row_parse_errors_sample=[{"row_index": None, "error_type": "parse_error", "error_message": str(exc)}],
+            status="failed",
+        )
+
+    mapped_fields = _json_mapped_fields(attribute_keys)
+    row_errors = [error.model_dump(mode="json") for error in parse_result.errors]
+    page_number = (metadata or {}).get("page_number")
+    page_offset = (metadata or {}).get("page_offset")
+    page_limit = (metadata or {}).get("page_limit")
+    return BvcParserDiagnosticResult(
+        payload_format="json",
+        file_path=file_path,
+        raw_payload_id=raw_payload_id,
+        payload_hash=payload_hash,
+        tables_found=0,
+        candidate_tables=[],
+        headers_detected=attribute_keys,
+        normalized_headers=attribute_keys,
+        rows_detected=len(records),
+        mapped_fields=mapped_fields,
+        unmapped_headers=[],
+        unmapped_fields=[key for key in attribute_keys if key not in HANDLED_JSON_KEYS],
+        missing_required_fields=sorted(MINIMUM_TABLE_FIELDS - set(mapped_fields)),
+        parseable_rows_count=len(parse_result.rows),
+        row_parse_errors_count=len(parse_result.errors),
+        row_parse_errors_sample=row_errors[:5],
+        selected_table_index=None,
+        selected_table_reason="selected JSON market data array",
+        source_trading_date=parse_result.source_trading_date,
+        source_timestamp=parse_result.source_timestamp,
+        source_timestamp_raw=parse_result.source_timestamp_raw,
+        source_timestamp_policy=parse_result.source_timestamp_policy,
+        raw_date_candidates=parse_result.raw_date_candidates,
+        pagination_detected=bool(pagination.get("pagination_detected")),
+        pagination_controls=pagination.get("pagination_controls", {}),
+        pagination_warnings=pagination.get("pagination_warnings", []),
+        page_number=page_number,
+        page_offset=page_offset,
+        page_limit=page_limit,
+        status=_status(
+            selected_index=0,
+            parseable_rows_count=len(parse_result.rows),
+            row_parse_errors_count=len(parse_result.errors),
+        ),
+    )
 
 
 def _extract_headers(table) -> list[str]:
@@ -246,9 +375,34 @@ def _status(*, selected_index: int | None, parseable_rows_count: int, row_parse_
     return "success"
 
 
+def _is_json_payload(
+    payload_text: str,
+    *,
+    content_type: str | None = None,
+    source_endpoint: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    if content_type and "json" in content_type.lower():
+        return True
+    if source_endpoint and "json" in source_endpoint:
+        return True
+    if (metadata or {}).get("collection_mode") == "live_json":
+        return True
+    return payload_text.lstrip().startswith("{")
+
+
+def _json_mapped_fields(attribute_keys: list[str]) -> list[str]:
+    fields: list[str] = []
+    keys = set(attribute_keys)
+    for field_name, aliases in JSON_FIELD_ALIASES.items():
+        if any(alias in keys for alias in aliases):
+            fields.append(field_name)
+    return fields
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Inspect BVC market listing HTML without normalizing data.")
-    parser.add_argument("file_path", nargs="?", help="Path to a local BVC HTML payload.")
+    parser = argparse.ArgumentParser(description="Inspect BVC market listing payloads without normalizing data.")
+    parser.add_argument("file_path", nargs="?", help="Path to a local BVC HTML or JSON payload.")
     parser.add_argument("--raw-payload-id", help="Inspect an existing raw_payloads row by ID.")
     return parser
 
