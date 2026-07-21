@@ -92,9 +92,12 @@ def test_bvc_normalizer_writes_prices_records_partial_errors_and_is_idempotent(d
     assert db_session.query(NormalizationError).count() == 1
 
     db_session.refresh(raw_payload)
-    assert raw_payload.status == "normalized"
-    assert raw_payload.metadata_["normalization_rows_normalized"] == 2
-    assert raw_payload.metadata_["normalization_errors_count"] == 1
+    # Target exact-content rows keep collection identity immutable.  The
+    # normalized tables/results above prove compatibility; processing state
+    # will move to processing_attempts in a later mission.
+    assert raw_payload.content_evidence_kind == "exact_entity_bytes"
+    assert raw_payload.status == "collected"
+    assert raw_payload.metadata_ is None
 
     instrument = db_session.query(Instrument).filter_by(symbol="SBK").one()
     optional_instrument = db_session.query(Instrument).filter_by(symbol="OFS").one()
@@ -312,8 +315,8 @@ def test_bvc_normalizer_uses_source_trading_date_timestamp_policy(db_session):
     assert price_bar.trading_date.isoformat() == "2026-05-15"
     assert price_bar.bar_timestamp.isoformat().startswith("2026-05-15T00:00:00")
     assert price_bar.metadata_["timestamp_policy"] == "trading_date_start_of_day"
-    assert raw_payload.metadata_["source_trading_date"] == "2026-05-15"
-    assert raw_payload.metadata_["source_timestamp_policy"] == "trading_date_only"
+    assert raw_payload.content_evidence_kind == "exact_entity_bytes"
+    assert raw_payload.metadata_ is None
 
 
 def test_bvc_normalizer_uses_collected_at_when_source_date_is_missing(db_session):

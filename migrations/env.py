@@ -13,8 +13,15 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+DATABASE_URL_ATTRIBUTE = "tradehub_data_database_url"
+
 
 def get_url() -> str:
+    explicit_url = config.attributes.get(DATABASE_URL_ATTRIBUTE)
+    if explicit_url is not None:
+        if not isinstance(explicit_url, str) or not explicit_url.strip():
+            raise RuntimeError(f"Alembic attribute {DATABASE_URL_ATTRIBUTE!r} must be a non-empty string")
+        return explicit_url
     return get_settings().database_url
 
 
@@ -50,4 +57,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

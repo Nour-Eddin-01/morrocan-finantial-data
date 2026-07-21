@@ -49,6 +49,11 @@ def update_raw_payload_status(
     error_message: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> RawPayload:
+    # Target exact-content rows are immutable content identities.  Processing
+    # state belongs to processing attempts, so legacy status/metadata writes
+    # deliberately become no-ops for those rows during dual-write.
+    if raw_payload.content_evidence_kind == "exact_entity_bytes":
+        return raw_payload
     raw_payload.status = status
     raw_payload.error_message = error_message
     if metadata:
@@ -62,6 +67,8 @@ def update_raw_payload_metadata(
     raw_payload: RawPayload,
     metadata: dict[str, Any],
 ) -> RawPayload:
+    if raw_payload.content_evidence_kind == "exact_entity_bytes":
+        return raw_payload
     raw_payload.metadata_ = {**(raw_payload.metadata_ or {}), **metadata}
     db.flush()
     return raw_payload

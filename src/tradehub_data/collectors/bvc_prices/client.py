@@ -1,12 +1,14 @@
-import asyncio
 from datetime import UTC, datetime
+import ssl
 
 import httpx
 
 from tradehub_data.collectors.bvc_prices.config import BvcPriceCollectorConfig
-from tradehub_data.collectors.bvc_prices.constants import TEMPORARY_STATUS_CODES
-from tradehub_data.collectors.bvc_prices.errors import BvcFetchError
-from tradehub_data.collectors.bvc_prices.models import BvcFetchResult
+from tradehub_data.collectors.bvc_prices.models import (
+    BvcFetchAttemptResult,
+    BvcHttpResponseEvidence,
+    BvcTransportFailureEvidence,
+)
 
 
 class BvcPriceClient:
@@ -19,85 +21,111 @@ class BvcPriceClient:
         self.config = config
         self.transport = transport
 
-    async def fetch(self, source_url: str, *, headers: dict[str, str] | None = None) -> BvcFetchResult:
+    async def fetch_attempt(
+        self,
+        source_url: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> BvcFetchAttemptResult:
+        """Perform exactly one HTTP hop and expose evidence without interpretation.
+
+        Retries and redirects deliberately live in the collector so every response
+        or transport failure can be committed before another network operation.
+        """
+
         request_headers = {"User-Agent": self.config.user_agent}
         if headers:
             request_headers.update(headers)
-        async with httpx.AsyncClient(
-            timeout=self.config.timeout_seconds,
-            headers=request_headers,
-            follow_redirects=True,
-            verify=self._verify_setting(),
-            transport=self.transport,
-        ) as client:
-            last_error: Exception | None = None
-            for attempt in range(self.config.max_retries + 1):
-                try:
-                    response = await client.get(source_url)
-                except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as exc:
-                    last_error = exc
-                    if attempt >= self.config.max_retries:
-                        message = str(exc) or exc.__class__.__name__
-                        raise BvcFetchError(
-                            self._format_network_error(exc, message),
-                            source_url=source_url,
-                            error_type=self._error_type(exc),
-                        ) from exc
-                    await self._sleep_before_retry(attempt)
-                    continue
-
-                if response.status_code in TEMPORARY_STATUS_CODES and attempt < self.config.max_retries:
-                    await self._sleep_before_retry(attempt)
-                    continue
-
-                if response.status_code >= 400:
-                    raise BvcFetchError(
-                        f"HTTP {response.status_code}",
-                        source_url=source_url,
-                        error_type="http_error",
-                    )
-
-                body_text = response.text
-                if not body_text:
-                    raise BvcFetchError("empty response body", source_url=source_url, error_type="empty_response")
-
-                return BvcFetchResult(
-                    source_url=str(response.url),
-                    http_status=response.status_code,
-                    content_type=response.headers.get("content-type"),
-                    body_text=body_text,
-                    fetched_at=datetime.now(UTC),
-                    headers=dict(response.headers),
-                )
-
-            raise BvcFetchError(
-                str(last_error) or last_error.__class__.__name__ if last_error else "request failed",
-                source_url=source_url,
-                error_type="fetch_error",
+        requested_at = datetime.now(UTC)
+        client: httpx.AsyncClient | None = None
+        try:
+            client = httpx.AsyncClient(
+                timeout=self.config.timeout_seconds,
+                headers=request_headers,
+                follow_redirects=False,
+                verify=self._verify_setting(),
+                transport=self.transport,
             )
+            response = await client.get(source_url)
+            response_received_at = datetime.now(UTC)
+            entity_body = response.content
+            finished_at = datetime.now(UTC)
+            redirect_locations = response.headers.get_list("location")
+            return BvcHttpResponseEvidence(
+                requested_at=requested_at,
+                response_received_at=response_received_at,
+                finished_at=finished_at,
+                requested_url=str(response.request.url),
+                response_url=str(response.url),
+                status_code=response.status_code,
+                entity_body=entity_body,
+                response_header_items=tuple(response.headers.multi_items()),
+                content_type=response.headers.get("content-type"),
+                redirect_location=(
+                    redirect_locations[0] if len(redirect_locations) == 1 else None
+                ),
+            )
+        except httpx.TransportError as exc:
+            finished_at = datetime.now(UTC)
+            error_code = classify_transport_error(exc)
+            return BvcTransportFailureEvidence(
+                requested_at=requested_at,
+                finished_at=finished_at,
+                safe_error_code=error_code,
+                safe_error_message=_SAFE_TRANSPORT_MESSAGES[error_code],
+            )
+        except (OSError, ValueError):
+            # SSL-context construction (notably an unreadable custom CA path)
+            # may fail before an httpx transport exists.  Return the same
+            # bounded evidence shape without exposing path or exception text.
+            finished_at = datetime.now(UTC)
+            error_code = (
+                "tls_verification_error"
+                if self.config.ca_bundle_path
+                else "network_error"
+            )
+            return BvcTransportFailureEvidence(
+                requested_at=requested_at,
+                finished_at=finished_at,
+                safe_error_code=error_code,
+                safe_error_message=_SAFE_TRANSPORT_MESSAGES[error_code],
+            )
+        finally:
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    # A returned response is already fully read.  Cleanup
+                    # failure must not replace or discard its evidence.
+                    pass
 
-    async def _sleep_before_retry(self, attempt: int) -> None:
-        if self.config.retry_backoff_seconds <= 0:
-            return
-        await asyncio.sleep(self.config.retry_backoff_seconds * (2**attempt))
-
-    def _verify_setting(self) -> bool | str:
+    def _verify_setting(self) -> bool | ssl.SSLContext:
         if not self.config.verify_ssl:
             return False
         if self.config.ca_bundle_path:
-            return self.config.ca_bundle_path
+            return ssl.create_default_context(cafile=self.config.ca_bundle_path)
         return True
 
-    def _error_type(self, exc: Exception) -> str:
-        message = str(exc).lower()
-        if "certificate" in message or "ssl" in message:
-            return "ssl_certificate_error"
-        return exc.__class__.__name__
 
-    def _format_network_error(self, exc: Exception, message: str) -> str:
-        if self._error_type(exc) != "ssl_certificate_error":
-            return message
-        ca_hint = ""
-        if self.config.verify_ssl and not self.config.ca_bundle_path:
-            ca_hint = " Set BVC_PRICE_COLLECTOR_CA_BUNDLE_PATH to a trusted CA bundle if the source requires an intermediate certificate."
-        return f"{message}.{ca_hint}".strip()
+_SAFE_TRANSPORT_MESSAGES = {
+    "timeout": "request timed out",
+    "connect_error": "connection failed",
+    "tls_verification_error": "TLS certificate verification failed",
+    "protocol_error": "HTTP protocol failure",
+    "network_error": "network request failed",
+}
+
+
+def classify_transport_error(exc: httpx.TransportError) -> str:
+    """Map transport exceptions to a stable code without returning exception text."""
+
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        message = str(exc).casefold()
+        if "certificate" in message or "ssl" in message or "tls" in message:
+            return "tls_verification_error"
+        return "connect_error"
+    if isinstance(exc, httpx.ProtocolError):
+        return "protocol_error"
+    return "network_error"

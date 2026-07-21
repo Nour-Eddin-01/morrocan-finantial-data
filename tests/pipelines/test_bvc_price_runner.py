@@ -4,7 +4,17 @@ from pathlib import Path
 
 from tradehub_data.collectors.bvc_prices.constants import BVC_PRICE_JSON_SOURCE_ENDPOINT, BVC_PRICE_PAYLOAD_TYPE
 from tradehub_data.collectors.bvc_prices.models import BvcPriceCollectorResult
-from tradehub_data.models import DataSource, Instrument, LatestPrice, PriceBar, RawPayload
+from tradehub_data.models import (
+    CollectionGroup,
+    CollectionGroupPage,
+    CollectionOccurrence,
+    CollectionPageSelection,
+    DataSource,
+    Instrument,
+    LatestPrice,
+    PriceBar,
+    RawPayload,
+)
 from tradehub_data.pipelines.bvc_prices import runner as runner_module
 from tradehub_data.pipelines.bvc_prices.runner import BvcPipelineRunner
 from tradehub_data.repositories.raw_payloads import insert_raw_payload_if_new
@@ -153,11 +163,24 @@ def test_bvc_pipeline_runs_multi_page_real_fixture_group(db_session):
 
     raw_payloads = db_session.query(RawPayload).all()
     assert len(raw_payloads) == 2
-    group_ids = {payload.metadata_["pagination_group_id"] for payload in raw_payloads}
-    assert len(group_ids) == 1
-    assert {payload.metadata_["page_number"] for payload in raw_payloads} == {1, 2}
-    assert {payload.metadata_["pagination_total_pages"] for payload in raw_payloads} == {2}
-    assert {payload.metadata_["source_trading_date"] for payload in raw_payloads} == {"2026-05-18"}
+    assert {payload.content_evidence_kind for payload in raw_payloads} == {
+        "exact_entity_bytes"
+    }
+    assert all(payload.metadata_ is None for payload in raw_payloads)
+    assert all(payload.status == "collected" for payload in raw_payloads)
+
+    # Each fixture load owns immutable acquisition evidence.  The runner's
+    # legacy multi-page aggregation remains a computed compatibility result;
+    # it no longer mutates raw-content rows with page/group processing state.
+    groups = db_session.query(CollectionGroup).all()
+    pages = db_session.query(CollectionGroupPage).all()
+    occurrences = db_session.query(CollectionOccurrence).all()
+    selections = db_session.query(CollectionPageSelection).all()
+    assert len(groups) == len(pages) == len(occurrences) == len(selections) == 2
+    assert {group.collection_mode for group in groups} == {"manual_fixture"}
+    assert {group.collection_status for group in groups} == {"success"}
+    assert {page.page_role for page in pages} == {"data"}
+    assert {occurrence.outcome for occurrence in occurrences} == {"fixture_loaded"}
 
 
 def test_bvc_pipeline_multi_page_missing_page_is_partial_success(db_session):

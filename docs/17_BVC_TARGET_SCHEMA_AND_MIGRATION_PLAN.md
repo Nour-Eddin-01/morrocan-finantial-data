@@ -1,0 +1,2266 @@
+# TradeHub Data — BVC Target Schema and Migration Plan
+
+**Status:** architecture and migration plan only  
+**Date:** 2026-07-20  
+**Scope:** the BVC equity-price vertical slice  
+**Normative parent:** `docs/16_BVC_DATA_QUALITY_AND_IDEMPOTENCY_CONTRACT.md`  
+**Current migration baseline:** `0001_initial_foundation`
+
+## Purpose and authority
+
+This document translates the approved BVC data-quality and idempotency contract into a concrete target PostgreSQL design and a phased migration plan. It does not create a migration and does not authorize a runtime behavior switch.
+
+The plan was checked against:
+
+- `AGENTS.md`;
+- `docs/REPOSITORY_REENTRY_REPORT_2026-07-16.md`;
+- `docs/02_DATABASE_SCHEMA.md`;
+- `docs/16_BVC_DATA_QUALITY_AND_IDEMPOTENCY_CONTRACT.md`;
+- the SQLAlchemy models under `src/tradehub_data/models/`;
+- `migrations/versions/0001_initial_foundation.py` and `migrations/env.py`;
+- the current source, raw-payload, instrument, price, quality, sync, and BVC read repositories;
+- the BVC collector, parsers, diagnostics, normalizer, and manual pipeline runner;
+- the BVC API routes and schemas; and
+- all current collector, parser, diagnostics, normalizer, runner, repository, API, and health tests.
+
+Where this plan and older schema prose disagree, the verified migration/model state describes the current database, while document 16 governs target behavior. Unverified BVC business meanings remain open; this plan does not infer them.
+
+Key verified implementation touchpoints are:
+
+| Layer | Current files and symbols that constrain this plan |
+|---|---|
+| Schema | `src/tradehub_data/models/{reference,source,raw,instrument,price,quality,sync}.py`; `migrations/versions/0001_initial_foundation.py` |
+| Raw acquisition | `BvcPriceClient.fetch`; `BvcPriceCollector.run`/`run_json_pages`; `insert_raw_payload_if_new`, `update_raw_payload_status`, and `update_raw_payload_metadata` |
+| Parsing/diagnostics | `parse_bvc_market_listing_html`, `parse_bvc_market_listing_json`, `json_payload_shape`, `diagnose_bvc_price_payload`, and `parse_decimal` |
+| Normalization | `BvcPriceNormalizer.normalize_payload`/`_normalize_row`; `upsert_instrument`, `upsert_latest_price`, `upsert_price_bar`, and `record_normalization_error` |
+| Pipeline state | `BvcPipelineRunner._run_payload`/`_run_payload_group`, `BvcPipelineGroupResult`, and `_group_status` |
+| Read API | `list_bvc_instruments`, `list_bvc_latest_prices`, `list_bvc_price_bars`, `bvc_data_freshness`, `bvc_diagnostics_summary`, API route functions in `api/bvc_market.py`, and schemas including `BvcFreshness` |
+| Tests | `tests/collectors/test_bvc_price_collector.py`, parser/diagnostics tests, `tests/normalizers/test_bvc_price_normalizer.py`, `tests/pipelines/test_bvc_price_runner.py`, `tests/repositories/test_foundation.py`, and API/health tests |
+
+### Core design decisions
+
+1. Keep the physical `raw_payloads` table and refactor it gradually into immutable raw-content storage. Do not rename it during the first migration series, because many current foreign keys and repositories use its IDs.
+2. Add first-class collection groups, logical pages, occurrences, page selections, and processing attempts. Content identity and collection occurrence identity are never conflated.
+3. Keep `instruments` as the canonical master, but add deterministic identity checks, sighting fields, current field provenance, and name-conflict evidence.
+4. Keep `latest_prices` as an API-compatible accepted projection/cache. Immutable `latest_price_revisions`, complete group memberships, publication attempts, and one accepted pointer are the audit authority.
+5. Keep `price_bars` as a compatibility projection that eventually contains accepted final daily bars only. Store observations in immutable daily-bar revisions. Do not activate BVC daily-bar publication until aggregate and finalization semantics are confirmed.
+6. Keep `normalization_errors` as logical error state, add the contract identity fields, and add immutable observation rows. Legacy rows that cannot be mapped remain explicitly unresolved during transition.
+7. Use checked `VARCHAR` vocabularies rather than PostgreSQL enums. This permits reviewed vocabulary evolution without enum-rewrite coupling.
+8. Use UUID primary keys for compatibility and database-generated positive `BIGINT` identity sequences only where deterministic event ordering is required. Runs do not receive a sequence because their legacy chronology is incomplete and no contract decision uses run order.
+9. Use `ON DELETE RESTRICT`/`NO ACTION` for audit and provenance foreign keys. No target audit path uses destructive cascade.
+10. Package the readiness manifest with the application build; do not store a self-asserted readiness truth in a database table.
+
+---
+
+## 1. Current schema inventory
+
+### 1.1 Global facts
+
+The ORM and `0001_initial_foundation.py` describe the same 14 tables. No structural ORM-to-migration drift was found. The current foundation has:
+
+- UUID primary keys generated by Python, with no PostgreSQL UUID server default;
+- `created_at` server defaults using `now()`;
+- `updated_at` insert defaults, but updates are advanced only by SQLAlchemy `onupdate`, not by direct SQL;
+- no `CHECK` constraints;
+- string status constants in `src/tradehub_data/models/enums.py` that PostgreSQL does not enforce;
+- implicit PostgreSQL `NO ACTION` foreign keys;
+- one Alembic revision, `0001_initial_foundation`; and
+- tests that create tables from ORM metadata in in-memory SQLite rather than applying Alembic to PostgreSQL.
+
+### 1.2 `exchanges`
+
+- **Purpose:** exchange reference data. BVC repository reads identify the market by `code='BVC'`.
+- **Important columns:** `id UUID`, `code VARCHAR(30)`, `name VARCHAR(255)`, `country_code VARCHAR(2)`, `currency_code VARCHAR(3)`, `timezone VARCHAR(80)`, optional URL/JSON metadata, persistence timestamps.
+- **Current key:** primary key `id`; unique `code`.
+- **Foreign keys:** none.
+- **Indexes:** the unique code index only.
+- **Status fields:** none.
+- **Provenance:** free-form metadata and persistence timestamps only.
+- **Limitations:** no canonical checks for code, country/currency codes, or timezone. These are not BVC price-slice blockers.
+- **Target action:** retain unchanged in the first migration series. Its ID is the publication-scope market key.
+
+### 1.3 `data_sources`
+
+- **Purpose:** source registry. BVC code uses `code='bvc_prices'`.
+- **Important columns:** `id`, unique `code`, `name`, `source_type`, optional `base_url`/country, `is_active`, generic integer `priority`, metadata, timestamps.
+- **Current key:** primary key `id`; unique `code`.
+- **Foreign keys:** none.
+- **Indexes:** the unique code index only.
+- **Status fields:** `is_active`; unchecked `source_type`.
+- **Provenance:** no field-specific authority contract; metadata is unvalidated.
+- **Limitations:** the generic priority cannot implement document 16's field-specific instrument, latest-price, and bar authority rules.
+- **Target action:** retain. Keep field-specific authority in versioned adapter policy/runtime code initially; a generic source-authority table is deferred unless a second source proves it necessary.
+
+### 1.4 `ingestion_runs`
+
+- **Purpose:** mutable collector/fixture-run envelope.
+- **Important columns:** source, collector name, run type/status, start/finish times, four integer counters, error message, metadata, creation time.
+- **Current key:** primary key `id`; no natural unique key or sequence.
+- **Foreign key:** non-null `source_id -> data_sources.id`.
+- **Indexes:** source, collector, status, started time, and `(source_id, started_at)`.
+- **Status fields:** code writes `running`, `success`, `partial_success`, or `failed`; database accepts any string.
+- **Provenance:** source, collector, run type, times, counts, and mutable metadata.
+- **Limitations:** negative counts and invalid timestamp/status combinations are legal; acquisition status is currently mistaken for end-to-end pipeline status; pagination/publication facts live in metadata; publication retry lineage is absent.
+- **Target action:** retain as the run envelope, add controlled role/lifecycle fields, and link all new audit entities to it. A production pipeline run is not successful until publication succeeds. Contract event ordering lives on groups, occurrences, processing attempts, and publication attempts.
+
+### 1.5 `raw_payloads`
+
+- **Purpose today:** content storage, one collection context, transport metadata, page/group metadata, parser/normalizer lifecycle, and diagnostics in one mutable row.
+- **Important columns:** source/run IDs, URL/endpoint, payload type, decoded JSON/text bodies, `payload_hash`, HTTP status/content type, collection/source times, mutable status/error/metadata, creation time.
+- **Current key:** primary key `id`; unique `(source_id, payload_hash)`.
+- **Foreign keys:** source required; ingestion run optional.
+- **Indexes:** source, run, payload hash, collection time, and status.
+- **Status fields:** unchecked `collected|parsed|normalized|failed|ignored` convention.
+- **Provenance:** only one run, URL, collection time, response status/header dictionary, and page/group context can be attached to deduplicated content.
+- **Confirmed limitations:**
+  - the current hash is SHA-256 over source URL plus newline-normalized decoded text, not exact entity bytes;
+  - exact post-transfer/pre-charset body bytes and byte length are absent;
+  - both body columns may be null or both populated;
+  - duplicate collection returns the old row and loses the new occurrence/freshness evidence;
+  - later code can mutate the old row's pagination stop metadata and processing status;
+  - all response headers are currently copied into metadata; and
+  - empty, malformed, unexpected-shape, non-2xx, retry, redirect, and no-response evidence can be lost before storage.
+- **Target action:** retain IDs and bodies, add exact-content columns for new writes, move all occurrence/context/processing facts to new tables, and deprecate legacy contextual columns only after dual-write validation.
+
+### 1.6 `instruments`
+
+- **Purpose:** normalized exchange instrument master, directly read by the API.
+- **Important columns:** company/exchange IDs, symbol, optional ISIN, name, type, currency, optional market/listing fields, source/raw provenance, activity, metadata, last seen, timestamps.
+- **Current keys:** primary key `id`; unique `(exchange_id, symbol)` and `(exchange_id, isin)`. PostgreSQL permits multiple null ISINs.
+- **Foreign keys:** company, exchange, source, raw payload; all retain referenced audit rows.
+- **Indexes:** company, exchange, symbol, ISIN, activity, plus explicit exchange/symbol and exchange/ISIN indexes. The latter overlap the unique indexes.
+- **Status fields:** `is_active`; unchecked `instrument_type`.
+- **Provenance:** one mutable source/raw tuple and one `last_seen_at`.
+- **Confirmed limitations:** no canonical symbol/ISIN checks; no `first_seen_at`; no field-quality or per-field provenance; no name-conflict representation; no source occurrence; and blind repository assignment lets missing/weaker/older rows erase valid values or move sightings backward. Every current BVC price row also supplies `is_active=true`.
+- **Current vocabulary inconsistency:** model constants declare `equity`, while API test fixtures also use `stock`; the missing database check currently hides this disagreement. The legacy audit must classify real values before any type check is added.
+- **Target action:** retain and extend. Do not replace the stable instrument IDs or API-facing canonical columns.
+
+### 1.7 `latest_prices`
+
+- **Purpose:** one mutable current price per instrument, directly read by list/detail endpoints.
+- **Important columns:** exact fixed-scale price/OHLC/change/amount fields, volume, price timestamp, trading date, source/raw IDs, quality status, metadata, timestamps.
+- **Current key:** primary key `id`; unique `instrument_id`.
+- **Foreign keys:** instrument required; source/raw optional.
+- **Indexes:** instrument, price timestamp, trading date, quality. The instrument index overlaps its unique index.
+- **Status/provenance:** unchecked quality status; a single source/raw pair; timestamp policy and source status are hidden in metadata.
+- **Confirmed limitations:** no immutable revisions, occurrence/group/publication provenance, price-kind fields, timestamp/trading-date source, correction history, evidence ranking, or atomic group visibility. Strictly older timestamps are skipped, but equal timestamps overwrite and concurrent writes race.
+- **Target action:** retain as a mutable accepted projection derived atomically from immutable revisions and the accepted group.
+
+### 1.8 `price_bars`
+
+- **Purpose:** mutable price history. The current normalizer inserts a nominal `1d` bar for every normalized observation.
+- **Important columns:** instrument, timeframe, timestamp/date, OHLCV/value/trade count, source/raw, adjustment/quality flags, metadata, timestamps.
+- **Current key:** primary key `id`; unique `(instrument_id, timeframe, bar_timestamp)`.
+- **Foreign keys:** instrument required; source/raw optional.
+- **Indexes:** current timestamp identity, trading date, quality.
+- **Status/provenance:** `is_adjusted`, unchecked quality, one source/raw pair, metadata.
+- **Confirmed limitations:** several intraday observations can create several `1d` bars on one trading date; there is no provisional/final state, adapter eligibility/finalization evidence, immutable revision, or accepted membership. Current `N.T`/`S` fixture tests expect bars even though their business semantics are unverified.
+- **Target action:** retain as a compatibility projection, audit duplicate dates, then enforce daily identity. It must eventually expose accepted final daily bars only; provisional observations remain in revisions.
+
+### 1.9 `normalization_errors`
+
+- **Purpose:** mutable normalization-error records.
+- **Important columns:** optional raw/run/source IDs, optional entity type, error type/message, raw fragment JSON, status, created/resolved times.
+- **Current key:** primary key only; no logical unique constraint.
+- **Foreign keys:** raw payload, run, and source are optional.
+- **Indexes:** raw, run, source, error type, status, creation time, and `(status, created_at)`.
+- **Status fields:** unchecked `open|ignored|fixed` convention.
+- **Provenance:** optional source/run/raw only; no row/rule/stage/version or processing attempt.
+- **Confirmed limitations:** application-side check-then-insert uses message/status and Python JSON equality; cosmetic messages change identity; concurrency can duplicate rows; lifecycle ordering and observations do not exist.
+- **Target action:** retain as logical error state, add the exact contract identity and lifecycle fields, and add immutable observations.
+
+### 1.10 `sync_states`
+
+- **Purpose:** mutable per-component operational note.
+- **Important columns:** unique component name, type/status, last success/failure/run, message/metadata, timestamps.
+- **Current key:** primary key `id`; unique `component_name`.
+- **Foreign key:** optional last run.
+- **Indexes:** explicit component-name index overlaps the unique index.
+- **Status/provenance:** unchecked status; optional run.
+- **Limitations:** unused by BVC collection, normalization, API freshness, or health; no chronology constraints; read-then-write repository races.
+- **Target action:** retain untouched. It must not become accepted-publication, freshness, or readiness truth.
+
+### 1.11 Unused foundation tables
+
+`sectors`, `companies`, `market_indices`, `latest_index_values`, and `index_bars` are structurally consistent between ORM and `0001`, but are not part of the implemented BVC price slice. `instruments.company_id` is currently normally null. These tables remain untouched in this migration plan. The current index repository does not justify redesigning them.
+
+---
+
+## 2. Target logical entities
+
+### 2.1 Design posture
+
+The smallest coherent target separates evidence from projections:
+
+```txt
+immutable response content
+    -> immutable collection occurrence
+    -> logical page selection
+    -> immutable processing attempts
+    -> immutable value revisions and group memberships
+    -> immutable publication attempt
+    -> one atomic accepted pointer plus API-facing projections
+```
+
+Mutable rows are allowed only as controlled current projections or lifecycle aggregates. They are never the sole audit evidence.
+
+### 2.2 Entity decisions
+
+| Logical responsibility | Proposed physical object | Decision |
+|---|---|---|
+| Immutable raw contents | `raw_payloads` after refactor | Reuse the existing table and IDs; exact bytes and exact hash are authoritative only for new/proven rows. |
+| Collection occurrences | `collection_occurrences` | Required new immutable table; one row per request attempt/response hop or fixture load. |
+| Pagination groups | `collection_groups` | Required new table; one immutable ordered acquisition attempt for one dataset/scope/mode. |
+| Logical group pages | `collection_group_pages` | Required new table; unique page number and offset within a group. |
+| Selected page occurrences | `collection_page_selections` | Required new immutable binding; one selected occurrence per page and no occurrence reused by another page. |
+| Processing attempts | `processing_attempts` | Required new immutable event table for diagnostics/parser/normalizer/group evaluation/staging. |
+| Instrument field provenance | `instrument_field_provenance` | Required current-provenance projection, one row per canonical instrument field. Full immutable instrument-field revision history is deferred. |
+| Instrument name conflicts | `instrument_name_conflicts` plus `instrument_name_conflict_observations` | Required unique candidate state plus immutable evidence from every processing/occurrence. No arrival-order winner. |
+| Latest-price revisions | `latest_price_revisions` | Required immutable material revisions with exact evidence and fingerprint. |
+| Latest-price confirmation/publication membership | `latest_price_group_memberships` | Required complete group snapshot; supplied and confirmed/reused rows point to one revision. It becomes published when its group is the accepted pointer target. |
+| Daily-bar revisions | `daily_bar_revisions` | Target required, but implementation is deferred until daily aggregate/finalization semantics are approved. |
+| Daily-bar group confirmations | `daily_bar_group_memberships` | Target required with revision work; records supplied/confirmed revisions per qualified group. |
+| Daily-bar accepted publication membership | `daily_bar_publication_memberships` | Target required before production historical publication; final revisions can span many accepted groups, so one current-snapshot pointer is insufficient. |
+| Logical normalization errors | expanded `normalization_errors` | Retain table/IDs where deterministically mappable; exact stable key becomes authoritative. |
+| Error observations | `normalization_error_observations` | Required immutable link from one logical error to each processing attempt that observed it. |
+| Publication attempts | `publication_attempts` | Required immutable attempt/run records, including failed retries and staged-set fingerprint. |
+| Accepted publication pointer | `accepted_publication_pointers` | Required mutable pointer unique by `(exchange_id, dataset_code, publication_channel)`; changed only in the same transaction as projection refresh. |
+| Safe operational diagnostics | `v_bvc_operational_diagnostics` | Required security-barrier/security-invoker view before a least-privilege production API role is activated. No raw body or retained header columns. |
+| Schema readiness manifest | packaged `src/tradehub_data/schema/required_schema_manifest.json` | Do not create a database manifest table. The application build states its expected Alembic head, object signatures, grants, and forbidden privileges independently of the database it checks. |
+
+No generic source-observation, event-bus, or metadata-EAV framework is proposed. The tables above exist only where document 16 cannot be enforced by the current schema or a validated field.
+
+---
+
+## 3. Current-to-target mapping
+
+| Current object | Target object | Action | Reason | Data migration needed |
+|---|---|---|---|---|
+| `exchanges` | `exchanges` | Retain unchanged | Stable BVC market identity and API assumption | No |
+| `data_sources` | `data_sources` | Retain unchanged initially | Stable source identity; generic priority is not reused as field authority | Audit source codes/metadata only |
+| `ingestion_runs` | expanded `ingestion_runs` | Retain and add columns/checks | Keep run envelope while separating acquisition, processing, and publication | Backfill only values directly supported by existing fields |
+| `raw_payloads` | immutable-content `raw_payloads` | Retain, add columns, deprecate contextual fields | Preserve IDs/FKs while separating content from occurrences | Yes; exact bytes usually cannot be reconstructed from legacy decoded text |
+| raw/run JSON pagination metadata | `collection_groups`, `collection_group_pages`, `collection_occurrences`, selections | Split | JSON metadata cannot prove attempts, retries, page ownership, or completeness | Only where evidence is sufficient; otherwise remain legacy-unknown |
+| raw mutable status/normalization metadata | `processing_attempts` | Split and deprecate | The same content can have several processing outcomes/rule versions | Do not invent historical attempts; optionally create labeled legacy snapshots only with proof |
+| `instruments` | expanded `instruments` plus provenance/conflict tables | Retain and add columns/tables | Stable IDs/API fields remain useful; merge audit is missing | Audit canonical identity, weak names, sightings, and provenance before constraints |
+| `latest_prices` | accepted `latest_prices` projection plus revisions/memberships | Convert to compatibility projection | Preserve endpoint query shape while preventing page-by-page/mixed publication | Existing rows may seed non-accepted `legacy_projection_snapshot` revisions only |
+| `price_bars` | accepted-final `price_bars` projection plus daily revisions/memberships | Migrate then constrain; publication deferred | Daily identity is date, not intraday timestamp; source finalization is unknown | Audit every legacy `1d` date; never auto-select conflicts or call them final |
+| `normalization_errors` | canonical logical errors plus observations | Retain and add columns; unresolved legacy rows remain transitional | Preserve history while establishing stable identity/concurrency safety | Map only derivable identities; no fabricated row locator/rule version |
+| `sync_states` | `sync_states` | Retain unchanged | Not authoritative for this slice | No |
+| latest raw-row freshness queries | safe occurrence/group/publication view | Replace | Deduplicated content timestamps are not collection freshness | No direct copy; derive after new events exist |
+| current diagnostics JSON aggregation | `v_bvc_operational_diagnostics` | Replace with safe bounded view | Current query loads raw rows/bodies and infers group state from mutable JSON | New group/attempt/publication data required |
+| unused foundation tables | same tables | Defer | Outside BVC price scope | No |
+
+### 3.1 `raw_payloads` transition
+
+The existing row ID remains the raw-content ID. Target meanings are:
+
+- **Payload body:** `entity_body BYTEA` is the authoritative exact client-visible entity body for new/proven data. Existing `payload_text` and `payload JSONB` remain legacy/derived compatibility columns until runtime readers move; neither can prove original pre-charset bytes.
+- **Payload hash:** add `entity_body_sha256 CHAR(64)` over `entity_body` only. Preserve current `payload_hash` and record its legacy algorithm; never relabel it as exact content identity.
+- **Source URL, endpoint, collected time, run, HTTP status, content type, headers, pagination, mutable status, source-published time:** move to occurrence/group/processing records for all new writes. Existing columns remain frozen legacy context during transition.
+- **Headers:** copy only allowlisted safe names into occurrences. Do not copy an unrestricted legacy dictionary. Existing unsafe metadata requires a separately approved scrub; meanwhile the API role must not select it.
+- **Source timestamps:** transport/source publication evidence belongs to the occurrence. Parsed row timestamps belong to immutable value revisions and processing evidence.
+- **Uniqueness:** add a partial unique exact-content index on `(source_id, entity_body_sha256)` for rows with `content_evidence_kind='exact_entity_bytes'`. Keep the old unique key until all old callers stop using it.
+- **Immutability:** target body/hash/source columns are insert-once; repository policy and database permissions prohibit updates. PostgreSQL cannot express general column immutability with a simple check, so writer-role grants, repository code, and optional later trigger review provide the backstop.
+
+### 3.2 `latest_prices` transition
+
+`latest_prices` remains the one-row-per-instrument accepted projection/cache because every existing normalized price endpoint reads it directly. It is not the revision ledger.
+
+Publication stages one `latest_price_group_memberships` row for every instrument in a complete group. The publisher first commits a `running` publication-attempt envelope and its own `running` run. The publication transaction then:
+
+1. locks the publication scope pointer;
+2. verifies the group-level processing attempt and staged-set fingerprint;
+3. refreshes every affected `latest_prices` row from the membership's immutable revision;
+4. removes or marks absent any prior projection member not present in the proven complete new scope, according to the approved coverage policy;
+5. advances `accepted_publication_pointers` to the new group/attempt and increments its version; and
+6. finalizes the attempt as `published` and its end-to-end run as `success`.
+
+Steps 3–6 commit atomically. Readers therefore see either the prior complete projection/pointer or the new complete projection/pointer, never page-by-page mixtures. If that transaction rolls back, a separate guarded failure-finalization transaction changes only the still-`running` attempt/run to `failed` with a safe code; it does not touch projection or pointer. A crash between rollback and failure finalization leaves `running`, which bounded recovery resolves after proving no pointer references that attempt. An ambiguous client retry reuses the same attempt UUID and returns the committed terminal result. An identical later group reuses revisions, creates new confirmation memberships, and advances collection freshness without changing supplying raw provenance.
+
+### 3.3 `price_bars` transition
+
+The canonical `1d` identity is:
+
+```txt
+instrument_id + timeframe='1d' + trading_date
+```
+
+`bar_timestamp` remains a deterministic Casablanca period anchor and an API field, not the daily unique key. The current timestamp unique constraint is replaced by:
+
+- partial unique daily identity `(instrument_id, timeframe, trading_date) WHERE timeframe='1d'`; and
+- timestamp/window identity `(instrument_id, timeframe, bar_timestamp) WHERE timeframe<>'1d'` for future non-daily data.
+
+Before the daily constraint is created, all same-date duplicates must be classified as identical, reconcilable with proven authority, or conflicting. Conflicting rows stop that phase. No legacy row is labeled final merely because it exists. `price_bars` becomes the accepted-final projection only after a verified final source contract and publication path exist. Until then, scheduler work must disable this adapter's daily-bar writes rather than perpetuate the current unverified behavior.
+
+### 3.4 `normalization_errors` transition
+
+The table is expanded to use document 16's exact logical key:
+
+```txt
+(raw_payload_id, processing_stage, entity_type, row_locator,
+ rule_code, field_name_key, rule_version)
+```
+
+Messages, fragments, runs, and occurrences are observations, not identity. New canonical rows have all seven identity fields non-null and are protected by a unique constraint. During migration, `identity_state='legacy_unresolved'` permits old rows whose identity cannot be proven; the unique constraint is initially partial on `identity_state='canonical'`. A later separately approved archive/reconciliation step is required before global `NOT NULL` can be asserted. New scheduler/runtime writes must never use the legacy state.
+
+---
+
+## 4. Proposed table specifications
+
+### 4.1 General conventions
+
+- UUID primary keys remain application-generated to avoid adding an extension solely for UUID defaults.
+- Event-order columns use `BIGINT GENERATED ALWAYS AS IDENTITY`, are positive, unique, and immutable.
+- All event instants use `TIMESTAMPTZ`; API serialization converts them to UTC.
+- Market identity uses `DATE` in `Africa/Casablanca`; PostgreSQL does not attach a timezone to a date.
+- Internal vocabularies use `VARCHAR` plus named `CHECK` constraints.
+- Machine codes/messages are bounded; unbounded exception text, URLs with private query data, body excerpts, and unsafe headers are prohibited.
+- Audit foreign keys use `ON DELETE RESTRICT` or equivalent `NO ACTION`. Projection rows may be rebuilt, but revisions, occurrences, attempts, memberships, and errors are retained.
+- Metadata JSON is permitted only for bounded non-authoritative diagnostics. Any field used for precedence, filtering, completeness, publication, or freshness is first-class.
+
+### 4.2 Changed `ingestion_runs`
+
+Responsibility: retain one run envelope while distinguishing acquisition, authoritative pipeline, validation, backfill, and publication-retry roles.
+
+```txt
+ingestion_runs (changed)
+- id UUID primary key                         # existing
+- source_id UUID not null                     # existing FK, RESTRICT
+- collector_name VARCHAR(120) not null        # existing
+- run_type VARCHAR(50) not null               # existing
+- run_role VARCHAR(40) not null               # new
+- parent_run_id UUID null                      # new self-FK, RESTRICT
+- status VARCHAR(30) not null                  # existing, checked
+- started_at TIMESTAMPTZ not null              # existing
+- finished_at TIMESTAMPTZ null                 # existing
+- records_collected INTEGER not null            # existing, nonnegative
+- records_inserted INTEGER not null             # existing, nonnegative
+- records_updated INTEGER not null              # existing, nonnegative
+- records_failed INTEGER not null               # existing, nonnegative
+- safe_error_code VARCHAR(80) null             # new
+- error_message TEXT null                      # existing, sanitized/bounded by writer
+- metadata JSONB null                          # existing, non-authoritative
+- created_at TIMESTAMPTZ not null              # existing
+```
+
+`run_role` values: `acquisition`, `authoritative_pipeline`, `validation`, `backfill`, `publication_retry`, and transitional `legacy_unclassified`. New target runs may not use `legacy_unclassified`. Status values: `running`, `success`, `partial_success`, `failed`. Running requires null `finished_at`; terminal states require `finished_at >= started_at`. Each publication attempt has its own `publication_retry` or authoritative pipeline run; failed history is not rewritten.
+
+Add unique `(id, source_id)` so downstream composite FKs cannot associate a run with a different source. Index `(source_id, run_role, status, started_at DESC)` and `parent_run_id` when non-null. Existing useful indexes remain until query plans prove redundancy.
+
+The collector/pipeline owns `started_at`/`finished_at`; PostgreSQL owns `created_at`. Source, role, collector, start time, and parent are immutable after insert. Only legal status/counter/finalization updates are allowed; terminal runs are immutable and never deleted while referenced.
+
+### 4.3 Changed `raw_payloads` as immutable content
+
+Responsibility: retain exact response/fixture content once, independent of how often or where it was received.
+
+```txt
+raw_payloads (changed)
+- id UUID primary key
+- source_id UUID not null references data_sources(id) RESTRICT
+- entity_body BYTEA null                       # non-null for exact/native rows
+- entity_body_sha256 CHAR(64) null             # lowercase hex; body only
+- entity_body_length BIGINT null
+- content_evidence_kind VARCHAR(40) not null    # exact_entity_bytes | legacy_decoded_text |
+                                                # legacy_jsonb_only | legacy_body_missing
+- entity_hash_algorithm VARCHAR(50) null        # sha256_entity_body_v1 for exact rows
+- storage_status VARCHAR(20) not null            # stored
+- payload_text TEXT null                        # legacy/temporary decoded cache
+- payload JSONB null                            # legacy/non-authoritative
+- payload_hash VARCHAR(64) not null              # legacy key retained during transition
+- legacy_hash_algorithm VARCHAR(80) null
+- payload_type VARCHAR(50) not null              # legacy context, frozen
+- ingestion_run_id UUID null                     # legacy context, frozen/deprecated
+- source_url TEXT null                           # legacy context, frozen/deprecated
+- source_endpoint TEXT null                      # legacy context, frozen/deprecated
+- http_status INTEGER null                       # legacy context, frozen/deprecated
+- content_type VARCHAR(120) null                 # legacy context, frozen/deprecated
+- collected_at TIMESTAMPTZ not null              # legacy context, frozen/deprecated
+- source_published_at TIMESTAMPTZ null           # legacy context, frozen/deprecated
+- status VARCHAR(30) not null                    # legacy lifecycle, frozen/deprecated
+- error_message TEXT null                        # legacy lifecycle, frozen/deprecated
+- metadata JSONB null                            # legacy context, frozen/deprecated
+- created_at TIMESTAMPTZ not null
+```
+
+Checks:
+
+- exact rows require non-null body/hash/length, a lowercase 64-character hex hash, `octet_length(entity_body)=entity_body_length`, and `entity_hash_algorithm='sha256_entity_body_v1'`;
+- legacy evidence kinds must not claim an exact hash unless independently proven;
+- length is nonnegative; storage status is only `stored` for target rows.
+
+Unique/index design:
+
+```txt
+UNIQUE INDEX uq_raw_payloads_source_entity_sha256
+  ON raw_payloads(source_id, entity_body_sha256)
+  WHERE content_evidence_kind='exact_entity_bytes';
+```
+
+Add unique `(id, source_id)` for source-coherent audit FKs. Keep `uq_raw_payloads_source_payload_hash` only for legacy compatibility until old writes stop. API roles receive no direct body/header select privilege.
+
+For a new exact row, mandatory legacy `payload_hash` must receive a namespaced compatibility digest such as `sha256("target-exact-compat-v1" + source_id + entity_body_sha256)`, with `legacy_hash_algorithm='target_exact_compat_filler_v1'`. It must not use the old URL/text algorithm, because that could collide with an old decoded-text row and falsely upgrade that historical row to exact-byte evidence. Later occurrences with the same exact bytes reuse the row through the new exact unique index. No target identity or freshness query may use the compatibility filler.
+
+Until legacy columns become nullable or are removed, a newly exact BVC content row uses deterministic compatibility values: `payload_type='bvc_price_snapshot'`; `collected_at` is the first storing occurrence's response time (or fixture load finish time) and is explicitly non-authoritative for freshness; `status='collected'` and never advances with processing; `error_message=null`; decoded `payload=null`; and URL/endpoint/HTTP/content-type/text fields reflect only the first occurrence/decoder when available. Later occurrences never update them. Target parser dispatch, grouping, status, provenance, and freshness use occurrence/processing fields, not these compatibility values.
+
+### 4.4 `collection_groups`
+
+Responsibility: one ordered, immutable acquisition attempt for one market dataset and declared mode/scope. Reprocessing does not create a new group.
+
+```txt
+collection_groups
+- id UUID primary key
+- group_sequence BIGINT identity unique not null
+- source_id UUID not null references data_sources(id) RESTRICT
+- exchange_id UUID not null references exchanges(id) RESTRICT
+- ingestion_run_id UUID not null
+- dataset_code VARCHAR(80) not null             # bvc_equity_prices
+- collection_mode VARCHAR(30) not null
+- group_purpose VARCHAR(30) not null
+- external_group_key VARCHAR(160) null          # display/import key, not ordering identity
+- page_limit INTEGER not null
+- started_at TIMESTAMPTZ not null
+- collection_completed_at TIMESTAMPTZ null
+- collection_status VARCHAR(30) not null
+- pagination_complete BOOLEAN null              # null while unresolved/running
+- completion_evidence_kind VARCHAR(50) not null
+- expected_pages INTEGER null
+- selected_data_pages INTEGER not null default 0
+- terminal_page_present BOOLEAN not null default false
+- coverage_status VARCHAR(20) not null
+- expected_instrument_count INTEGER null
+- observed_instrument_count INTEGER null
+- collection_stop_reason VARCHAR(80) null
+- safe_diagnostic_codes JSONB not null default '[]'
+- finalized_at TIMESTAMPTZ null
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (ingestion_run_id, source_id)
+    REFERENCES ingestion_runs(id, source_id) ON DELETE RESTRICT
+- UNIQUE (id, source_id)
+- UNIQUE (id, source_id, ingestion_run_id, page_limit)
+- UNIQUE (id, exchange_id, dataset_code)
+- UNIQUE (id, source_id, exchange_id, dataset_code)
+```
+
+Modes: `live_json`, `live_html`, `manual_fixture`, `replay`, `backfill`. Purposes: `production`, `validation`, `backfill`. Collection states: `running`, `success`, `partial_success`, `failed`. Coverage: `unknown`, `proven`, `failed`. Completion evidence includes `authoritative_total`, `short_page`, `terminal_sentinel`, `max_pages_exact_authoritative_total`, `declared_fixture_scope`, `none`, and `unknown_legacy`.
+
+The group is mutable only through legal acquisition-finalization transitions. Once `finalized_at` is set, ownership, mode, sequence, page limit, collection timestamps, completion evidence, and collection outcome are immutable. Processing and publication results are derived from immutable attempts, not overwritten into this row.
+
+Constraints include positive limits/counts, terminal timestamps ordered after start, terminal states requiring `finalized_at`, successful collection requiring `pagination_complete=true`, and production purpose prohibiting fixture mode. The composite run FK prevents a group from claiming a source different from its run. The four-column unique key supports the page offset/run/source ownership constraint below.
+
+Indexes: source/mode/sequence, exchange/dataset/purpose/sequence, collection status/sequence, and completeness/sequence. `group_sequence`, never timestamps or UUIDs, orders groups.
+
+### 4.5 `collection_group_pages`
+
+Responsibility: one required logical page/offset position inside a group.
+
+```txt
+collection_group_pages
+- id UUID primary key
+- group_id UUID not null
+- source_id UUID not null
+- ingestion_run_id UUID not null
+- page_limit INTEGER not null
+- logical_page_number INTEGER not null
+- page_offset INTEGER not null
+- page_role VARCHAR(30) not null               # data | terminal_sentinel | unknown
+- collection_page_outcome VARCHAR(30) not null # pending | success | failed
+- structural_reason_code VARCHAR(80) null
+- created_at TIMESTAMPTZ not null
+- finalized_at TIMESTAMPTZ null
+- FOREIGN KEY (group_id, source_id, ingestion_run_id, page_limit)
+    REFERENCES collection_groups(id, source_id, ingestion_run_id, page_limit)
+    ON DELETE RESTRICT
+- UNIQUE (group_id, logical_page_number)
+- UNIQUE (group_id, page_offset)
+- UNIQUE (id, source_id, ingestion_run_id)
+- UNIQUE (id, source_id, group_id)
+```
+
+Checks require one-based page numbers, nonnegative offsets, and:
+
+```txt
+page_offset = (logical_page_number - 1) * collection_groups.page_limit
+```
+
+Because a check cannot reference the parent row, this plan deliberately copies `source_id`, `ingestion_run_id`, and `page_limit` into the page row solely for the composite FK shown above. The named page check enforces `page_offset=(logical_page_number-1)*page_limit`. The copied values cannot disagree with the group and are never independently writable. This avoids a trigger while making source/run ownership and the offset formula directly enforceable by PostgreSQL.
+
+Page selection and processing determine `success`/`failed`; a missing expected page is represented by a page row with no selection and failed outcome. Pages freeze with their group.
+
+The two unique group keys are the main indexes; add `(group_id,collection_page_outcome,logical_page_number)` for bounded status reads. The collector owns `finalized_at`, PostgreSQL owns `created_at`, and terminal page ownership/role/outcome is immutable. Audit FKs restrict deletion.
+
+### 4.6 `collection_occurrences`
+
+Responsibility: immutable evidence of every request attempt/redirect response/transport failure or manual fixture load.
+
+```txt
+collection_occurrences
+- id UUID primary key
+- occurrence_sequence BIGINT identity unique not null
+- source_id UUID not null
+- ingestion_run_id UUID not null
+- group_page_id UUID not null
+- raw_payload_id UUID null
+- request_sequence INTEGER not null
+- attempt_number INTEGER not null
+- redirect_hop INTEGER not null
+- logical_request_url TEXT not null
+- requested_url TEXT null
+- response_url TEXT null
+- source_endpoint VARCHAR(160) null
+- request_profile VARCHAR(80) not null
+- requested_at TIMESTAMPTZ not null
+- response_received_at TIMESTAMPTZ null
+- finished_at TIMESTAMPTZ not null
+- source_published_at TIMESTAMPTZ null
+- http_status SMALLINT null
+- content_type VARCHAR(120) null
+- body_length BIGINT null
+- outcome VARCHAR(30) not null
+- safe_error_code VARCHAR(80) null
+- safe_error_message VARCHAR(500) null
+- safe_response_headers JSONB not null default '{}'
+- dropped_response_header_name_count INTEGER not null default 0
+- response_headers_overflow BOOLEAN not null default false
+- response_headers_policy_version VARCHAR(50) not null
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (ingestion_run_id, source_id)
+    REFERENCES ingestion_runs(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (group_page_id, source_id, ingestion_run_id)
+    REFERENCES collection_group_pages(id, source_id, ingestion_run_id)
+    ON DELETE RESTRICT
+- FOREIGN KEY (raw_payload_id, source_id)
+    REFERENCES raw_payloads(id, source_id) ON DELETE RESTRICT
+- UNIQUE (ingestion_run_id, request_sequence, attempt_number, redirect_hop)
+- UNIQUE (id, group_page_id)
+- UNIQUE (id, source_id, raw_payload_id)
+- UNIQUE (id, source_id, raw_payload_id, group_page_id)
+```
+
+Identity numbers are one-based except `redirect_hop`, which is zero-based. URLs are sanitized before insert; only approved public BVC query keys remain. `request_profile` identifies safe configured request behavior without storing complete request headers.
+
+Outcomes are exactly `success_response`, `redirect_response`, `http_error_response`, `transport_failure`, and `fixture_loaded`. Named checks enforce document 16's complete evidence matrix:
+
+- success requires raw content, response URL/time, and status 200–299;
+- redirect requires the same evidence and status 301/302/303/307/308;
+- HTTP error requires response evidence and status 100–599 outside the prior classes;
+- transport failure requires null raw/response/status evidence and non-null safe error evidence;
+- fixture load requires raw content and null HTTP response URL/time/status;
+- every response time lies between request and finish; all outcomes require `requested_at <= finished_at`;
+- `body_length` matches the referenced raw content for exact rows through repository validation; direct cross-row equality requires a trigger and is not introduced initially.
+
+Safe headers use the exact seven-name allowlist from document 16, stored as lowercase-name to string-array JSON. Database checks enforce JSON-object type, nonnegative drop count, and maximum encoded size. Repository validation enforces keys, singleton/repeat rules, value bounds, control-character rejection, and deterministic overflow; unknown names are never persisted.
+
+Indexes: `(source_id, occurrence_sequence DESC)`, `(ingestion_run_id, occurrence_sequence)`, `(group_page_id, occurrence_sequence)`, `(raw_payload_id, occurrence_sequence)` where non-null, and `(outcome, occurrence_sequence DESC)`.
+
+### 4.7 `collection_page_selections`
+
+Responsibility: immutable choice of the first qualifying successful occurrence for one logical page.
+
+```txt
+collection_page_selections
+- group_page_id UUID primary key
+- occurrence_id UUID unique not null
+- selected_at TIMESTAMPTZ not null
+- selection_reason VARCHAR(80) not null
+- selected_by_processing_attempt_id UUID null
+- FOREIGN KEY (occurrence_id, group_page_id)
+    REFERENCES collection_occurrences(id, group_page_id) ON DELETE RESTRICT
+- FOREIGN KEY (selected_by_processing_attempt_id)
+    REFERENCES processing_attempts(id) ON DELETE RESTRICT
+```
+
+The primary key gives one selection per page; unique occurrence gives one selected page per occurrence; the composite FK makes cross-page selection impossible. Only `success_response` or `fixture_loaded` occurrences that pass role/structure rules are repository-eligible. The collector settles all requests already in flight for the logical page before inserting the selection; normal retries are sequential and stop after the first qualifying success. If the closed attempt set contains several successful occurrences with different exact bodies, the page fails and no selection is inserted. If an anomalous response/failure is recorded after selection but before group finalization, the selection remains audit evidence, while the page/group finalize failed/production-ineligible and that selection is unusable for membership/publication. After group finalization, repositories reject any new occurrence for that group; recovery starts a new group rather than rewriting terminal history. A selection is never deleted or replaced.
+
+Indexes are provided by the primary/unique keys; add `selected_at` only if an operational query proves it necessary. Rows are insert-only. `selection_reason` uses a checked bounded vocabulary, and `selected_by_processing_attempt_id`, when present, is an audit FK added after the processing table exists.
+
+### 4.8 `processing_attempts`
+
+Responsibility: immutable diagnostics/parser/normalizer/repository-validation/group-evaluation/publication-staging execution evidence.
+
+```txt
+processing_attempts
+- id UUID primary key
+- processing_attempt_sequence BIGINT identity unique not null
+- source_id UUID not null
+- ingestion_run_id UUID not null
+- group_id UUID null
+- group_page_id UUID null
+- collection_occurrence_id UUID null
+- raw_payload_id UUID null
+- processing_stage VARCHAR(40) not null
+- component_version VARCHAR(100) not null
+- rule_version VARCHAR(100) not null
+- input_fingerprint_algorithm VARCHAR(80) not null
+- input_fingerprint CHAR(64) not null
+- status VARCHAR(30) not null
+- started_at TIMESTAMPTZ not null
+- completed_at TIMESTAMPTZ null
+- rows_found INTEGER not null default 0
+- rows_usable INTEGER not null default 0
+- rows_failed INTEGER not null default 0
+- errors_count INTEGER not null default 0
+- selected_pages_evaluated INTEGER null
+- duplicate_symbol_count INTEGER null
+- blocking_conflict_count INTEGER null
+- staged_revision_count INTEGER null
+- pagination_complete_evaluated BOOLEAN null
+- coverage_status_evaluated VARCHAR(20) null
+- acceptance_eligibility VARCHAR(20) null       # not_evaluated | eligible | ineligible
+- eligibility_reason_codes TEXT[] null
+- output_fingerprint_algorithm VARCHAR(80) null
+- output_fingerprint CHAR(64) null
+- safe_diagnostic_codes JSONB not null default '[]'
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (ingestion_run_id, source_id)
+    REFERENCES ingestion_runs(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (group_id, source_id)
+    REFERENCES collection_groups(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (group_page_id, source_id, group_id)
+    REFERENCES collection_group_pages(id, source_id, group_id) ON DELETE RESTRICT
+- FOREIGN KEY (raw_payload_id, source_id)
+    REFERENCES raw_payloads(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (collection_occurrence_id, source_id, raw_payload_id, group_page_id)
+    REFERENCES collection_occurrences(id, source_id, raw_payload_id, group_page_id)
+    ON DELETE RESTRICT
+- UNIQUE (id, group_id)
+- UNIQUE (id, collection_occurrence_id, group_id)
+- UNIQUE (id, source_id, raw_payload_id)
+- UNIQUE (id, source_id, raw_payload_id, collection_occurrence_id)
+```
+
+`id` is generated before the unit of work starts and retained by the caller across transaction/connection retry. It is therefore the idempotency key: an ambiguous retry inserts the same UUID and loads the already committed attempt, while an intentional reprocessing generates a new UUID and a new immutable attempt. Do not add a composite uniqueness rule that collapses deliberate reprocessing of the same input/rule version. `processing_attempt_sequence` supplies total observation order after insert.
+
+Stages: `diagnostics`, `parser`, `normalizer`, `repository_validation`, `group_evaluation`, `publication_staging`. Statuses: `running`, `success`, `partial_success`, `failed`, `skipped`. Page stages require matching raw/page/occurrence/group context; reprocessing without a request requires raw and null occurrence/page; group evaluation/staging require a group and deliberately allow null raw/occurrence/page. Named checks enforce these shapes. Counts are nonnegative; a running row has null `completed_at`, while a terminal row requires `completed_at >= started_at`. Fingerprints are lowercase SHA-256 plus algorithm identifiers. Group-evaluation-only fields are null for page stages and checked/required where applicable. `acceptance_eligibility='eligible'` requires successful group result, proven evaluated pagination and coverage, zero duplicate symbols/blocking conflicts, production-compatible mode/purpose, and a non-null staged count/fingerprint. A group-level output fingerprint covers the sorted complete set of instrument/revision fingerprints and is what publication attempts bind.
+
+The running envelope is inserted and committed before work begins. Canonical outputs, error observations, counters/fingerprints, and the one legal `running -> terminal` finalization occur atomically. Once terminal, the row is immutable. If a process crashes, recovery either retries with the same caller-held UUID or, after a bounded lease/ownership check defined by the future runner, marks that attempt failed with a safe `processing_interrupted` code. It never creates a fake collection occurrence or reports an abandoned `running` row as normalized freshness.
+
+Group publication state is derived without overwriting group history: no evaluation is `not_evaluated`; the latest group evaluation yields `ineligible` or `eligible`; a failed attempt for that same staging yields `publication_failed`; the current pointer yields `published`; and a formerly published group no longer referenced by the pointer is `superseded`.
+
+Indexes: group and sequence, page and sequence, raw/rule version, completed sequence for freshness, and status/stage. No processing time is copied into the immutable collection group.
+
+### 4.9 Changed `instruments`
+
+Responsibility: current canonical instrument master, with deterministic identity/sighting state.
+
+New columns:
+
+```txt
+- first_seen_at TIMESTAMPTZ null
+- material_collection_occurrence_id UUID null references collection_occurrences(id) RESTRICT
+- last_confirmation_occurrence_id UUID null references collection_occurrences(id) RESTRICT
+- name_origin VARCHAR(40) not null
+- name_quality VARCHAR(40) not null
+- name_resolution_state VARCHAR(30) not null
+- identity_evidence_state VARCHAR(30) not null   # canonical | legacy_unverified
+```
+
+Existing `source_id` and `raw_payload_id` remain the paired supplier of the latest accepted unconflicted material transition, never merely the latest sighting. `first_seen_at`/`last_seen_at` are authentic observation bounds, not persistence times. Checks enforce their ordering, canonical symbol/ISIN syntax, nonblank name, BVC currency/type at the adapter boundary, and controlled name states. Retain the existing `(exchange_id,symbol)` and `(exchange_id,isin)` unique constraints; PostgreSQL's ordinary unique semantics already allow multiple null ISINs, so a replacement partial index would add churn without stronger identity protection.
+
+For canonical BVC evidence, add composite FK `(raw_payload_id,source_id) -> raw_payloads(id,source_id)` and composite FK `(material_collection_occurrence_id,source_id,raw_payload_id) -> collection_occurrences(id,source_id,raw_payload_id)`. A named check requires the material tuple together for `identity_evidence_state='canonical'`; legacy-unverified rows may retain incomplete tuple fields but cannot claim complete master provenance. Keep the existing symbol lookup index, replace redundant compound indexes only after plan review, and add bounded indexes for `(exchange_id,is_active,symbol)`, `last_seen_at`, and conflict state if actual queries use them. `instruments` is a mutable locked projection; identity/material transitions are transactional, while raw evidence is never deleted.
+
+### 4.10 `instrument_field_provenance`
+
+Responsibility: current accepted supplier and confirmation evidence for each canonical material instrument field.
+
+```txt
+instrument_field_provenance
+- id UUID primary key
+- instrument_id UUID not null references instruments(id) RESTRICT
+- field_name VARCHAR(40) not null
+- canonical_value_type VARCHAR(20) not null
+- canonical_value_text VARCHAR(512) not null
+- value_quality VARCHAR(40) not null
+- authority_rank INTEGER not null
+- source_id UUID not null references data_sources(id) RESTRICT
+- raw_payload_id UUID not null references raw_payloads(id) RESTRICT
+- material_occurrence_id UUID null references collection_occurrences(id) RESTRICT
+- processing_attempt_id UUID not null references processing_attempts(id) RESTRICT
+- established_observation_at TIMESTAMPTZ null
+- last_confirmed_at TIMESTAMPTZ null
+- last_confirmation_occurrence_id UUID null references collection_occurrences(id) RESTRICT
+- created_at TIMESTAMPTZ not null
+- updated_at TIMESTAMPTZ not null
+- UNIQUE (instrument_id, field_name)
+```
+
+Allowed fields are `symbol`, `isin`, `name`, `instrument_type`, `currency_code`, and `is_active`. Canonical text is a typed audit mirror and must equal the associated master value; repository transactions enforce cross-table equality. Direct cross-table value equality is not practical as a check constraint. This is deliberately a current-provenance projection, not a general EAV master or full field-revision ledger. Raw/occurrence/processing records retain the evidence; if regulated field-history requirements emerge, immutable revisions require a separate approved design.
+
+Named checks close field-name, value-type, quality, nonblank canonical-value, and timestamp-order vocabularies. The source/raw/occurrence supplier tuple changes only in the same locked instrument merge transaction as the canonical field; a weaker confirmation may advance confirmation fields but cannot change material provenance. Rows are retained with `ON DELETE RESTRICT`. Index source/raw/material occurrence and last-confirmation occurrence for audits; the unique `(instrument_id,field_name)` is the canonical lookup.
+
+Use composite source/raw and optional source/raw/material-occurrence FKs analogous to the instrument master, plus `(processing_attempt_id,source_id,raw_payload_id)` to the attempt tuple. PostgreSQL therefore prevents mixed suppliers even though equality between `canonical_value_text` and the master column remains repository-checked.
+
+### 4.11 `instrument_name_conflicts`
+
+Responsibility: preserve every unique same-authority descriptive name candidate without selecting the first committer.
+
+```txt
+instrument_name_conflicts
+- id UUID primary key
+- instrument_id UUID not null references instruments(id) RESTRICT
+- canonical_name VARCHAR(255) not null
+- authority_rank INTEGER not null
+- first_observed_at TIMESTAMPTZ null
+- last_observed_at TIMESTAMPTZ null
+- observation_count BIGINT not null default 0
+- lifecycle_status VARCHAR(20) not null
+- resolved_by_processing_attempt_id UUID null references processing_attempts(id) RESTRICT
+- resolution_reason VARCHAR(80) null
+- resolved_at TIMESTAMPTZ null
+- created_at TIMESTAMPTZ not null
+- UNIQUE (instrument_id, canonical_name, authority_rank)
+```
+
+This row is unique candidate state, not one evidence row per raw body. Statuses are `active`, `resolved`, `superseded`. Active tied candidates force `instruments.name_resolution_state='conflicted'` and symbol-as-name public placeholder. Resolution requires a stronger authority or audited operator/source rule; weak or identical rows cannot clear it. First/last observation aggregates follow authentic observation/attempt order, not transaction time.
+
+Checks enforce nonblank canonical names, nonnegative counts, `first_observed_at<=last_observed_at`, controlled lifecycle values, and complete/null resolution tuples. Index `(instrument_id,lifecycle_status,authority_rank)`. Candidate state is updated only through observation aggregation and audited lifecycle transitions; it is never hard-deleted.
+
+### 4.11.1 `instrument_name_conflict_observations`
+
+Responsibility: immutable source/raw/occurrence evidence for every processing attempt that emitted one conflict candidate.
+
+```txt
+instrument_name_conflict_observations
+- id UUID primary key
+- instrument_name_conflict_id UUID not null
+    references instrument_name_conflicts(id) RESTRICT
+- source_id UUID not null references data_sources(id) RESTRICT
+- raw_payload_id UUID not null
+- collection_occurrence_id UUID null
+- processing_attempt_id UUID not null
+- observed_at TIMESTAMPTZ not null
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (raw_payload_id, source_id)
+    REFERENCES raw_payloads(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (collection_occurrence_id, source_id, raw_payload_id)
+    REFERENCES collection_occurrences(id, source_id, raw_payload_id)
+    ON DELETE RESTRICT
+- FOREIGN KEY (processing_attempt_id, source_id, raw_payload_id)
+    REFERENCES processing_attempts(id, source_id, raw_payload_id)
+    ON DELETE RESTRICT
+- UNIQUE (instrument_name_conflict_id, processing_attempt_id)
+```
+
+Reprocessing with a new attempt creates a new observation; retrying the same attempt ID does not. Fixture/reprocessing observations may have null occurrence but never fabricate a sighting time; `observed_at` is processing observation time and is not instrument market/source time. Index candidate/time, source/raw, and occurrence. Rows are insert-only and cascade deletion is prohibited.
+
+### 4.12 `latest_price_revisions`
+
+Responsibility: immutable, coherent latest-price material states and correction provenance. A revision is value evidence; group membership is observation/publication evidence.
+
+```txt
+latest_price_revisions
+- id UUID primary key
+- evidence_state VARCHAR(30) not null            # native | legacy_projection_snapshot
+- instrument_id UUID not null references instruments(id) RESTRICT
+- trading_date DATE not null
+- trading_date_source VARCHAR(30) not null
+- price_timestamp TIMESTAMPTZ not null
+- timestamp_source VARCHAR(30) not null
+- price NUMERIC not null
+- open_price NUMERIC null
+- high_price NUMERIC null
+- low_price NUMERIC null
+- previous_close NUMERIC null
+- change_value NUMERIC null
+- change_percent NUMERIC null
+- volume BIGINT null
+- traded_value NUMERIC null
+- market_cap NUMERIC null
+- number_of_trades INTEGER null
+- price_kind VARCHAR(30) not null
+- selected_price_field VARCHAR(80) not null
+- price_semantics_confirmed BOOLEAN not null
+- source_status_raw VARCHAR(120) null
+- source_status_normalized VARCHAR(120) null
+- source_status_semantics_confirmed BOOLEAN null
+- source_status_mapping_version VARCHAR(80) null
+- data_quality_status VARCHAR(20) not null
+- quality_reason_codes TEXT[] not null default '{}'
+- configured_source_authority INTEGER not null
+- source_adapter_code VARCHAR(80) not null
+- source_record_identity_kind VARCHAR(30) not null
+- source_record_identifier VARCHAR(160) null
+- source_id UUID not null references data_sources(id) RESTRICT
+- raw_payload_id UUID not null
+- collection_occurrence_id UUID null
+- processing_attempt_id UUID null
+- fingerprint_algorithm VARCHAR(80) not null
+- material_fingerprint CHAR(64) not null
+- previous_revision_id UUID null references latest_price_revisions(id) RESTRICT
+- correction_reason VARCHAR(80) null
+- source_revision_identifier VARCHAR(160) null
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (raw_payload_id, source_id)
+    REFERENCES raw_payloads(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (collection_occurrence_id, source_id, raw_payload_id)
+    REFERENCES collection_occurrences(id, source_id, raw_payload_id)
+    ON DELETE RESTRICT
+- FOREIGN KEY (processing_attempt_id, source_id, raw_payload_id,
+               collection_occurrence_id)
+    REFERENCES processing_attempts(id, source_id, raw_payload_id,
+                                   collection_occurrence_id)
+    ON DELETE RESTRICT
+- UNIQUE (instrument_id, fingerprint_algorithm, material_fingerprint)
+- UNIQUE (id, instrument_id)
+- FOREIGN KEY (previous_revision_id, instrument_id)
+    REFERENCES latest_price_revisions(id, instrument_id) ON DELETE RESTRICT
+```
+
+The fingerprint uses exactly `bvc-latest-price-material-v1` from document 16. It deliberately excludes occurrence/group IDs, allowing identical content in a later group or another equally trusted source to reuse a material revision. A later confirmation is represented by membership, not by changing the revision's original supplying provenance.
+
+Native revisions require non-null occurrence and processing-attempt provenance. `legacy_projection_snapshot` permits those two FKs to be null, is never eligible for a group membership or accepted pointer, and exists only to preserve a comparable pre-cutover projection. A legacy row missing source/raw provenance is reported but does not seed a revision.
+
+Checks enforce:
+
+- `native` requires occurrence/processing provenance, while `legacy_projection_snapshot` requires no membership/publication use;
+- controlled trading-date/timestamp source, price-kind, source-record-identity, and quality vocabularies;
+- `valid|suspect` only for canonical revisions; a blocking condition creates no revision;
+- the source-status absent/unmapped/mapped tri-state and mapping-version rule;
+- sorted unique bounded quality reason codes through repository validation, with a database array-size bound;
+- exact numeric domain rules from section 6;
+- nonnegative price/OHLC/previous close/volume/value/capitalization/trade-count values, while signed change and percentage values remain legal;
+- correction reason and previous revision either both null or both non-null; and
+- lowercase fingerprint syntax and the declared algorithm.
+
+The composite self-FK makes a correction predecessor belong to the same instrument. Repository validation additionally rejects self-reference/cycles and requires a correction chain to follow document 16's ordering and authority rules; direct-SQL PostgreSQL tests cover cross-instrument predecessors, while repository integration tests cover self-reference and longer cycles. Indexes: instrument/date/timestamp, instrument/timestamp-source/date, raw content, occurrence, processing attempt, source status, selected field/price kind, and quality. The immutable row is never updated or deleted.
+
+### 4.13 `latest_price_group_memberships`
+
+Responsibility: the complete staged current snapshot for one group, including confirmations that reuse an old revision.
+
+```txt
+latest_price_group_memberships
+- group_id UUID not null references collection_groups(id) RESTRICT
+- instrument_id UUID not null references instruments(id) RESTRICT
+- latest_price_revision_id UUID not null references latest_price_revisions(id) RESTRICT
+- processing_attempt_id UUID not null references processing_attempts(id) RESTRICT
+- collection_occurrence_id UUID not null references collection_occurrences(id) RESTRICT
+- membership_kind VARCHAR(20) not null          # supplied | confirmed
+- source_row_locator VARCHAR(160) not null
+- created_at TIMESTAMPTZ not null
+- PRIMARY KEY (group_id, instrument_id)
+- UNIQUE (group_id, source_row_locator)
+- UNIQUE (group_id, instrument_id, latest_price_revision_id)
+- FOREIGN KEY (latest_price_revision_id, instrument_id)
+    REFERENCES latest_price_revisions(id, instrument_id) ON DELETE RESTRICT
+- FOREIGN KEY (processing_attempt_id, collection_occurrence_id, group_id)
+    REFERENCES processing_attempts(id, collection_occurrence_id, group_id)
+    ON DELETE RESTRICT
+```
+
+The selected composite FKs prove revision/instrument identity and carry the membership occurrence/group through one coherent processing attempt. Repository validation additionally requires that occurrence to be the immutable selection for its logical page and that the page outcome remains successful. A group with duplicate symbols/identities, a missing required instrument, or a blocking conflict cannot form an eligible complete membership set.
+
+The group-level `publication_staging` processing attempt fingerprints the sorted pairs `(instrument_id, revision fingerprint)`. The accepted pointer makes this whole set public. There is no carry-forward membership for an instrument absent from the collected group unless a separately approved authoritative coverage contract explicitly permits it.
+
+Membership kind and row locator are checked/nonblank. Index revision, processing attempt, and occurrence for audit/reuse queries. Rows are insert-only, use database `created_at`, and all deletes are restricted.
+
+### 4.14 Changed `latest_prices`
+
+Responsibility: API-compatible materialized projection of the currently accepted BVC current-snapshot publication.
+
+New columns:
+
+```txt
+- current_revision_id UUID null UNIQUE references latest_price_revisions(id) RESTRICT
+- accepted_group_id UUID null references collection_groups(id) RESTRICT
+- accepted_publication_attempt_id UUID null references publication_attempts(id) RESTRICT
+- number_of_trades INTEGER null
+- projection_state VARCHAR(30) not null          # legacy_unverified | accepted
+```
+
+The existing unique `instrument_id` remains the one-current-row invariant and existing financial/provenance columns remain for response compatibility. Add composite FK `(current_revision_id,instrument_id) -> latest_price_revisions(id,instrument_id)`, composite FK `(accepted_group_id,instrument_id,current_revision_id) -> latest_price_group_memberships(group_id,instrument_id,latest_price_revision_id)`, and composite FK `(accepted_publication_attempt_id,accepted_group_id) -> publication_attempts(id,group_id)`. Once `projection_state='accepted'`, all three new FKs are non-null. The copied financial/source/raw values must equal the revision; that value equality and complete-scope refresh are repository transaction rules with PostgreSQL integration tests. Projection timestamps remain persistence timestamps and never replace market or collection timestamps.
+
+Legacy rows may remain `legacy_unverified` before publication activation; they do not establish an accepted pointer or accepted-group freshness. After activation, production API reads must use only `accepted` projection rows whose group matches the scope pointer.
+
+Retain instrument/date/timestamp/quality read indexes and add accepted-group/publication lookup indexes. Projection rows are intentionally mutable only inside the publication transaction; `updated_at` is publication-owned, not source freshness. A projection can be rebuilt from revisions/memberships and may be deleted/reinserted only as part of the same locked complete-scope transaction.
+
+### 4.15 `daily_bar_revisions`
+
+Responsibility: immutable provisional/final daily observation revisions. This table is specified now but deferred until BVC daily-aggregate semantics are approved.
+
+```txt
+daily_bar_revisions
+- id UUID primary key
+- instrument_id UUID not null references instruments(id) RESTRICT
+- timeframe VARCHAR(20) not null                # initially 1d only
+- trading_date DATE not null
+- bar_timestamp TIMESTAMPTZ not null            # Casablanca period anchor
+- bar_state VARCHAR(20) not null                 # provisional | final
+- open_price NUMERIC null
+- high_price NUMERIC null
+- low_price NUMERIC null
+- close_price NUMERIC not null
+- volume BIGINT null
+- traded_value NUMERIC null
+- number_of_trades INTEGER null
+- is_adjusted BOOLEAN not null
+- daily_aggregate_eligible BOOLEAN not null
+- adapter_contract_version VARCHAR(100) not null
+- daily_bar_source_authority INTEGER not null
+- timestamp_source VARCHAR(30) not null
+- source_observed_at TIMESTAMPTZ not null
+- selected_close_field VARCHAR(80) not null
+- price_kind VARCHAR(30) not null
+- price_semantics_confirmed BOOLEAN not null
+- source_status_raw VARCHAR(120) null
+- source_status_normalized VARCHAR(120) null
+- source_status_semantics_confirmed BOOLEAN null
+- source_status_mapping_version VARCHAR(80) null
+- data_quality_status VARCHAR(20) not null
+- quality_reason_codes TEXT[] not null default '{}'
+- finalization_signal VARCHAR(100) null
+- finalization_authority INTEGER null
+- source_revision_identifier VARCHAR(160) null
+- source_id UUID not null references data_sources(id) RESTRICT
+- raw_payload_id UUID not null
+- collection_occurrence_id UUID not null
+- processing_attempt_id UUID not null
+- fingerprint_algorithm VARCHAR(80) not null
+- material_fingerprint CHAR(64) not null
+- previous_revision_id UUID null references daily_bar_revisions(id) RESTRICT
+- correction_reason VARCHAR(80) null
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (raw_payload_id, source_id)
+    REFERENCES raw_payloads(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (collection_occurrence_id, source_id, raw_payload_id)
+    REFERENCES collection_occurrences(id, source_id, raw_payload_id)
+    ON DELETE RESTRICT
+- FOREIGN KEY (processing_attempt_id, source_id, raw_payload_id,
+               collection_occurrence_id)
+    REFERENCES processing_attempts(id, source_id, raw_payload_id,
+                                   collection_occurrence_id)
+    ON DELETE RESTRICT
+- UNIQUE (instrument_id, fingerprint_algorithm, material_fingerprint)
+- UNIQUE (id, instrument_id, timeframe, trading_date)
+- FOREIGN KEY (previous_revision_id, instrument_id, timeframe, trading_date)
+    REFERENCES daily_bar_revisions(id, instrument_id, timeframe, trading_date)
+    ON DELETE RESTRICT
+```
+
+The fingerprint is exactly `bvc-daily-bar-material-v1`. The composite self-FK prevents a correction from crossing instrument/timeframe/trading-date identity; direct-SQL PostgreSQL tests exercise cross-identity predecessors, while repository integration tests reject self-reference and longer cycles. Provisional rows require verified `daily_aggregate_eligible=true`; final rows additionally require nonblank finalization evidence and approved authority. `coursCourant`, `N.T`, `S`, page completion, or clock time cannot satisfy finalization by themselves. Numeric and status checks mirror the latest revision rules.
+
+Index daily identity/state, instrument/date, raw/occurrence/processing, and finalization/source-revision fields needed for correction checks. Revisions are insert-only with database-owned `created_at`; every audit FK restricts deletion.
+
+### 4.16 `daily_bar_group_memberships`
+
+Responsibility: link a qualified group observation or confirmation to a daily revision, including provisional preview provenance.
+
+```txt
+daily_bar_group_memberships
+- group_id UUID not null references collection_groups(id) RESTRICT
+- instrument_id UUID not null references instruments(id) RESTRICT
+- timeframe VARCHAR(20) not null
+- trading_date DATE not null
+- daily_bar_revision_id UUID not null references daily_bar_revisions(id) RESTRICT
+- processing_attempt_id UUID not null references processing_attempts(id) RESTRICT
+- collection_occurrence_id UUID not null references collection_occurrences(id) RESTRICT
+- membership_kind VARCHAR(20) not null          # supplied | confirmed
+- created_at TIMESTAMPTZ not null
+- PRIMARY KEY (group_id, instrument_id, timeframe, trading_date)
+- FOREIGN KEY (daily_bar_revision_id, instrument_id, timeframe, trading_date)
+    REFERENCES daily_bar_revisions(id, instrument_id, timeframe, trading_date)
+    ON DELETE RESTRICT
+- FOREIGN KEY (processing_attempt_id, collection_occurrence_id, group_id)
+    REFERENCES processing_attempts(id, collection_occurrence_id, group_id)
+    ON DELETE RESTRICT
+```
+
+The repository proves revision identity matches the copied instrument/timeframe/date. Only a pagination-complete, successfully normalized, nonblocking group may support preview visibility. Membership alone does not make a bar official history.
+
+Check `timeframe='1d'` for this first slice and `membership_kind IN ('supplied','confirmed')`. Index revision, occurrence, and processing attempt. Rows are insert-only, database timestamped, and deletion-restricted.
+
+### 4.17 `daily_bar_publication_memberships`
+
+Responsibility: immutable proof that one final daily revision was accepted into historical publication. Historical ranges can legitimately span many publication attempts/groups.
+
+```txt
+daily_bar_publication_memberships
+- id UUID primary key
+- publication_attempt_id UUID not null references publication_attempts(id) RESTRICT
+- group_id UUID not null references collection_groups(id) RESTRICT
+- instrument_id UUID not null references instruments(id) RESTRICT
+- timeframe VARCHAR(20) not null
+- trading_date DATE not null
+- daily_bar_revision_id UUID not null references daily_bar_revisions(id) RESTRICT
+- accepted_at TIMESTAMPTZ not null
+- supersedes_membership_id UUID null references daily_bar_publication_memberships(id) RESTRICT
+- created_at TIMESTAMPTZ not null
+- UNIQUE (publication_attempt_id, instrument_id, timeframe, trading_date)
+- UNIQUE (id, instrument_id, timeframe, trading_date)
+- UNIQUE (id, instrument_id, timeframe, trading_date, daily_bar_revision_id)
+- FOREIGN KEY (daily_bar_revision_id, instrument_id, timeframe, trading_date)
+    REFERENCES daily_bar_revisions(id, instrument_id, timeframe, trading_date)
+    ON DELETE RESTRICT
+- FOREIGN KEY (publication_attempt_id, group_id)
+    REFERENCES publication_attempts(id, group_id) ON DELETE RESTRICT
+- FOREIGN KEY (supersedes_membership_id, instrument_id, timeframe, trading_date)
+    REFERENCES daily_bar_publication_memberships(
+      id, instrument_id, timeframe, trading_date
+    ) ON DELETE RESTRICT
+```
+
+Only `bar_state='final'` revisions can be inserted. The composite supersession FK prevents a correction chain from crossing instrument/timeframe/trading-date identity; repository validation rejects self-reference/cycles and requires the prior membership to precede the new attempt. Corrections create a later accepted membership and update the `price_bars` projection for the same daily identity; old membership remains. Ordinary public history derives only from accepted final membership/projection, never provisional rows.
+
+The final-state rule is repository-validated against the referenced revision and asserted by PostgreSQL integration/diagnostic checks; a trigger is deferred. Index canonical daily identity ordered by `accepted_at`, group, revision, and supersession. Membership rows are insert-only and deletion-restricted; `accepted_at` is publication time, not trading/collection time.
+
+### 4.18 Changed `price_bars`
+
+Responsibility: compatibility projection of the current accepted final revision for each bar identity.
+
+New/changed columns and constraints:
+
+```txt
+- current_revision_id UUID null UNIQUE references daily_bar_revisions(id) RESTRICT
+- accepted_publication_membership_id UUID null UNIQUE
+    references daily_bar_publication_memberships(id) RESTRICT
+- projection_state VARCHAR(30) not null          # legacy_unverified | accepted_final
+- bar_state VARCHAR(20) not null                 # legacy_unverified | final
+
+UNIQUE INDEX uq_price_bars_daily_identity
+  ON price_bars(instrument_id, timeframe,trading_date)
+  WHERE timeframe='1d';
+
+UNIQUE INDEX uq_price_bars_intraday_identity
+  ON price_bars(instrument_id,timeframe,bar_timestamp)
+  WHERE timeframe<>'1d';
+```
+
+The existing global timestamp unique constraint is dropped only after the replacement indexes are valid and legacy audits pass. Accepted rows require revision/membership pointers; legacy rows remain visibly unverified and are excluded after API activation. Financial fields remain duplicated only to preserve efficient current API reads; revision equality is a repository invariant.
+
+Add a composite FK from `(accepted_publication_membership_id,instrument_id,timeframe,trading_date,current_revision_id)` to the corresponding unique tuple on `daily_bar_publication_memberships`. This prevents a projection from claiming a membership for another instrument/date/revision. Copied financial-value equality remains a repository/verification invariant.
+
+Retain/add indexes for `(instrument_id,timeframe,trading_date DESC)`, accepted membership/revision, and quality. `price_bars` is a mutable projection only inside a successful final-history publication transaction; persistence timestamps never substitute for bar or collection time.
+
+### 4.19 Changed `normalization_errors`
+
+Responsibility: current lifecycle and aggregate evidence for one stable logical error.
+
+```txt
+normalization_errors (changed)
+- id UUID primary key                              # existing ID retained
+- identity_state VARCHAR(30) not null             # canonical | legacy_unresolved
+- raw_payload_id UUID null -> eventually not null for canonical rows
+- source_id UUID null -> eventually not null for canonical rows
+- processing_stage VARCHAR(40) null -> not null
+- entity_type VARCHAR(80) null -> not null
+- row_locator VARCHAR(160) null -> not null
+- rule_code VARCHAR(100) null -> not null
+- field_name_key VARCHAR(100) null -> not null
+- rule_version VARCHAR(100) null -> not null
+- lifecycle_status VARCHAR(20) not null
+- first_message VARCHAR(500) null
+- latest_message VARCHAR(500) null
+- first_seen_at TIMESTAMPTZ null
+- last_seen_at TIMESTAMPTZ null
+- observation_count BIGINT not null default 0
+- recurrence_count BIGINT not null default 0
+- recurrence_of_normalization_error_id UUID null self-FK RESTRICT
+- resolved_by_raw_payload_id UUID null references raw_payloads(id) RESTRICT
+- resolved_by_processing_attempt_id UUID null references processing_attempts(id) RESTRICT
+- resolution_occurrence_sequence BIGINT null
+- resolution_processing_attempt_sequence BIGINT null
+- resolution_reason VARCHAR(80) null
+- superseded_by_rule_version VARCHAR(100) null
+- sanitized_context JSONB null
+- created_at TIMESTAMPTZ not null                  # existing, retained
+- resolved_at TIMESTAMPTZ null                     # existing, retained
+- ingestion_run_id UUID null                       # legacy compatibility
+- error_type VARCHAR(80) not null                  # legacy compatibility
+- error_message TEXT not null                      # legacy compatibility
+- raw_fragment JSONB null                          # legacy compatibility
+- status VARCHAR(30) not null                      # legacy compatibility
+- FOREIGN KEY (raw_payload_id, source_id)
+    REFERENCES raw_payloads(id, source_id) ON DELETE RESTRICT
+- UNIQUE (id, raw_payload_id, source_id)
+```
+
+Initial canonical uniqueness is:
+
+```txt
+UNIQUE INDEX uq_normalization_errors_logical_key
+ON normalization_errors(
+  raw_payload_id, processing_stage, entity_type, row_locator,
+  rule_code, field_name_key, rule_version
+)
+WHERE identity_state='canonical';
+```
+
+New writes always use canonical identity and non-null fields. Once all unresolved legacy rows are reconciled or moved under separately approved archival policy, the key becomes a full unique constraint and identity columns become globally non-null. Lifecycle values are `active`, `resolved`, `ignored`, `superseded`. Messages and bounded/redacted context do not participate in identity.
+
+Until legacy columns are removed, canonical writes populate them deterministically but never read them as authority: `error_type=rule_code`; `error_message=latest_message`; `raw_fragment=null`; run/source are the safe processing context; and compatibility `status` maps `active->open`, `resolved->fixed`, `ignored->ignored`, and `superseded->superseded`. The last value is intentionally outside the old tuple but is honest and remains non-open to legacy counts. Lifecycle transitions update this compatibility projection in the same transaction as canonical state. Canonical rows require nonblank first/latest messages; legacy-unresolved rows retain their original columns unchanged.
+
+Named checks enforce canonical non-null identity, lifecycle/resolution tuple consistency, nonnegative counters, and first/last time ordering. Identity columns are immutable after insert; lifecycle aggregates may change only by sequence-aware repository transitions; no row is hard-deleted. Index canonical active errors by `(lifecycle_status,last_seen_at)`, raw/rule/field, recurrence, and resolution attempt. Legacy indexes remain until old diagnostics are retired.
+
+### 4.20 `normalization_error_observations`
+
+Responsibility: immutable evidence that a processing attempt observed one logical error.
+
+```txt
+normalization_error_observations
+- id UUID primary key
+- normalization_error_id UUID not null
+- processing_attempt_id UUID not null
+- source_id UUID not null
+- raw_payload_id UUID not null
+- observed_at TIMESTAMPTZ not null
+- observed_message VARCHAR(500) not null
+- sanitized_context JSONB null
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (normalization_error_id, raw_payload_id, source_id)
+    REFERENCES normalization_errors(id, raw_payload_id, source_id)
+    ON DELETE RESTRICT
+- FOREIGN KEY (processing_attempt_id, source_id, raw_payload_id)
+    REFERENCES processing_attempts(id, source_id, raw_payload_id)
+    ON DELETE RESTRICT
+- UNIQUE (normalization_error_id, processing_attempt_id)
+```
+
+The two composite FKs require the logical error and processing attempt to carry the same `source_id`/`raw_payload_id`; an observation cannot attach an error for raw content A to an attempt for raw content B. The attempt supplies occurrence/group/raw and immutable sequence context. First/latest error fields are selected by `(observed_at, processing_attempt_sequence)`, never commit order. Resolution/reopening uses the occurrence or processing sequence boundaries defined in document 16. Observation upsert is concurrency-safe and idempotent.
+
+Indexes: error/time, processing attempt, and active-error joins through the logical row. Context is size-bounded and redacted before persistence.
+
+### 4.21 `publication_attempts`
+
+Responsibility: immutable record of every attempt to atomically publish an unchanged staged revision set.
+
+```txt
+publication_attempts
+- id UUID primary key
+- publication_attempt_sequence BIGINT identity unique not null
+- ingestion_run_id UUID unique not null
+- source_id UUID not null
+- group_id UUID not null
+- group_processing_attempt_id UUID not null
+- exchange_id UUID not null references exchanges(id) RESTRICT
+- dataset_code VARCHAR(80) not null
+- publication_channel VARCHAR(40) not null
+- publication_kind VARCHAR(30) not null         # current_snapshot | daily_history
+- staged_fingerprint_algorithm VARCHAR(80) not null
+- staged_revision_fingerprint CHAR(64) not null
+- attempt_number INTEGER not null
+- previous_attempt_id UUID null references publication_attempts(id) RESTRICT
+- status VARCHAR(20) not null                    # running | published | failed
+- started_at TIMESTAMPTZ not null
+- finished_at TIMESTAMPTZ null
+- safe_error_code VARCHAR(80) null
+- safe_error_message VARCHAR(500) null
+- created_at TIMESTAMPTZ not null
+- FOREIGN KEY (ingestion_run_id, source_id)
+    REFERENCES ingestion_runs(id, source_id) ON DELETE RESTRICT
+- FOREIGN KEY (group_id, source_id, exchange_id, dataset_code)
+    REFERENCES collection_groups(id, source_id, exchange_id, dataset_code)
+    ON DELETE RESTRICT
+- FOREIGN KEY (group_processing_attempt_id, group_id)
+    REFERENCES processing_attempts(id, group_id) ON DELETE RESTRICT
+- UNIQUE (group_id, group_processing_attempt_id,
+          staged_revision_fingerprint, attempt_number)
+- UNIQUE (id, group_id)
+- UNIQUE (id, source_id, exchange_id, dataset_code, publication_channel,
+          publication_kind, group_id, group_processing_attempt_id,
+          staged_fingerprint_algorithm, staged_revision_fingerprint)
+- UNIQUE (id, source_id, exchange_id, dataset_code, publication_channel,
+          publication_kind, group_id, group_processing_attempt_id,
+          staged_fingerprint_algorithm, staged_revision_fingerprint, status)
+- FOREIGN KEY (
+    previous_attempt_id, source_id, exchange_id, dataset_code,
+    publication_channel, publication_kind, group_id,
+    group_processing_attempt_id, staged_fingerprint_algorithm,
+    staged_revision_fingerprint
+  ) REFERENCES publication_attempts(
+    id, source_id, exchange_id, dataset_code, publication_channel,
+    publication_kind, group_id, group_processing_attempt_id,
+    staged_fingerprint_algorithm, staged_revision_fingerprint
+  ) ON DELETE RESTRICT
+```
+
+The status-free unique tuple supports the composite retry-chain FK; the otherwise identical status-bearing tuple supports the accepted pointer. Checks enforce positive attempt number, `attempt_number=1` exactly when `previous_attempt_id IS NULL`, timestamp/status consistency, same scope/group/stage/fingerprint for a retry chain, and terminal failure evidence. Repository logic locks the predecessor and requires its attempt number to equal the new number minus one; a PostgreSQL negative test rejects skipped or branched retry numbering. The row is inserted/committed as `running`; only `running -> published|failed` is legal, and terminal rows are immutable. Changed staged content is a new group-processing revision, not a retry. A failed attempt and its run remain failed even when a later attempt publishes.
+
+Publication failure durability uses two transaction boundaries intentionally:
+
+1. commit the running attempt/run envelope;
+2. try the atomic projection/pointer/published-finalization transaction;
+3. after rollback only, commit a guarded failed-finalization transaction.
+
+If step 3 itself cannot commit, recovery identifies stale running attempts. It marks one failed only when no accepted pointer references it; a pointer-referenced attempt is necessarily reconciled to `published`. The recovery policy uses safe codes and never repeats changed staging under the same attempt.
+
+Index scope/sequence, group/staging fingerprint/attempt number, status/started time, and previous attempt. The publisher owns start/finish timestamps; PostgreSQL owns creation time. Scope, group, stage, fingerprint, attempt number, and prior-attempt linkage are immutable; only the one legal terminal finalization is mutable. Every FK restricts deletion.
+
+### 4.22 `accepted_publication_pointers`
+
+Responsibility: the one current accepted snapshot for a publication scope.
+
+```txt
+accepted_publication_pointers
+- id UUID primary key
+- exchange_id UUID not null references exchanges(id) RESTRICT
+- dataset_code VARCHAR(80) not null
+- publication_channel VARCHAR(40) not null
+- accepted_source_id UUID not null references data_sources(id) RESTRICT
+- accepted_publication_kind VARCHAR(30) not null  # current_snapshot
+- accepted_publication_status VARCHAR(20) not null # published
+- accepted_group_id UUID not null
+- publication_attempt_id UUID unique not null
+- group_processing_attempt_id UUID not null
+- accepted_staged_fingerprint_algorithm VARCHAR(80) not null
+- accepted_staged_revision_fingerprint CHAR(64) not null
+- pointer_version BIGINT not null
+- accepted_at TIMESTAMPTZ not null
+- created_at TIMESTAMPTZ not null
+- updated_at TIMESTAMPTZ not null
+- UNIQUE (exchange_id, dataset_code, publication_channel)
+- FOREIGN KEY (
+    publication_attempt_id, accepted_source_id, exchange_id, dataset_code,
+    publication_channel, accepted_publication_kind, accepted_group_id,
+    group_processing_attempt_id,
+    accepted_staged_fingerprint_algorithm,
+    accepted_staged_revision_fingerprint, accepted_publication_status
+  ) REFERENCES publication_attempts(
+    id, source_id, exchange_id, dataset_code, publication_channel,
+    publication_kind, group_id, group_processing_attempt_id,
+    staged_fingerprint_algorithm, staged_revision_fingerprint, status
+  ) ON DELETE RESTRICT
+```
+
+For this slice the production scope is `(BVC, bvc_equity_prices, production)`. Named checks fix `accepted_publication_kind='current_snapshot'` and `accepted_publication_status='published'`; the composite FK therefore makes it impossible for the pointer to reference a running, failed, daily-history, wrong-source, or wrong-scope attempt. Repository logic locks this row or its deterministic scope key, verifies all referenced scope/group/fingerprint values agree, refreshes `latest_prices`, and updates the pointer in one transaction. `pointer_version` increases by exactly one. No pointer is created from legacy projections, partial groups, fixture validation, or failed publication attempts.
+
+This pointer is for the current snapshot. Accepted final historical bars use per-bar publication memberships, because one historical range spans many groups.
+
+Checks require positive `pointer_version`, valid channel/dataset syntax, and ordered persistence times. The unique scope is the primary access path; index accepted group and attempt for diagnostics. This is an intentionally mutable pointer, changed only under a locked compare-and-swap publication transaction. It cannot be deleted while the scope is active; rollback means atomically repointing/rebuilding to a previously accepted complete set under an approved procedure, not deleting history.
+
+### 4.23 `v_bvc_operational_diagnostics`
+
+Responsibility: bounded, least-privilege freshness and pipeline aggregates for the API role.
+
+The view exposes, by declared BVC production scope:
+
+- latest attempt occurrence/time/outcome;
+- latest collected occurrence/time/outcome;
+- latest successful collection group/time;
+- latest group, complete group, normalized group, and accepted group IDs/sequences/statuses;
+- accepted-group collection completion, latest published price timestamp/date, and data availability;
+- explicit incomplete/stale dimensions, with unknown where policy is absent;
+- selected page/row/error aggregates scoped to latest attempt and accepted groups;
+- source-status and selected-price-field counts from safe canonical revisions; and
+- publication attempt state and safe machine error codes.
+
+It never projects or depends on raw body/text/decoded JSON, retained response-header values, unsafe URLs, raw fragments, free-form exception text, or unbounded metadata. The implementation should use small helper views only if each remains security-manifested. It must be `security_barrier` and `security_invoker` on PostgreSQL 16, owned by a non-login migration owner, and queryable by an API role that cannot select `raw_payloads` or occurrence header columns directly.
+
+### 4.24 Readiness manifest representation
+
+No schema-readiness table is added. A table stored in the database cannot independently prove that the connected schema matches the running build. A packaged immutable manifest must include:
+
+- build ID and exact expected Alembic head set;
+- required tables/views and ordered column/type/nullability signatures;
+- complete unique/index/check/FK signatures, including predicates and delete behavior;
+- canonical diagnostics-view definition hash, owner, options, dependencies, and output signature;
+- required read grants; and
+- forbidden effective privileges, ownership, role inheritance, and raw-body/header access.
+
+The selected package path is `src/tradehub_data/schema/required_schema_manifest.json`; future packaging must explicitly include it in the built distribution. The canonical signature format still requires approval before readiness implementation. Alembic remains the schema mutation authority; readiness is read-only.
+
+### 4.25 Authoritative state derivation
+
+No one overloaded status column represents the pipeline. The authoritative layers are:
+
+| Layer | Stored authority | Notes |
+|---|---|---|
+| Raw storage | `raw_payloads.storage_status='stored'` | Says only that immutable content exists; it never means parsed or normalized |
+| Transport | `collection_occurrences.outcome` | One immutable outcome per attempt/hop, including failures recovered by a retry |
+| Logical page acquisition | `collection_group_pages.collection_page_outcome` plus selection | A successful selected data page is distinct from a terminal sentinel and from row normalization |
+| Pagination group acquisition | `collection_groups.collection_status`, `pagination_complete`, completion/coverage evidence | Frozen after acquisition/structure finalization; later processing does not rewrite it |
+| Page processing | immutable `processing_attempts` | Parser/normalizer success, partial success, failure, or skip by rule version |
+| Group processing/eligibility | latest applicable `group_evaluation` attempt | Stores rows/errors/duplicates/conflicts, evaluated completeness/coverage, and eligible/ineligible result |
+| Publication | immutable `publication_attempts` plus current pointer | Failed tries remain; pointer identifies only the current accepted snapshot |
+| End-to-end production run | `ingestion_runs.status` for `authoritative_pipeline`/retry role | Success only after publication; partial for usable but ineligible processing; failed for no usable result, blocking integrity, or publication failure |
+
+Required consequences include:
+
+- an empty/malformed first page stores response content but fails the page/group and cannot be complete;
+- a valid empty later sentinel may prove completion only after contiguous prior pages succeed;
+- a later fetch failure or unknown `max_pages` stop leaves `pagination_complete=false`, group partial/failed, and publication prohibited;
+- `max_pages` is complete only when independent authoritative total evidence proves exact coverage;
+- row-level errors leave acquisition success intact but make processing/group partial and ineligible;
+- a failed retry followed by one qualifying successful response can yield a successful selected page while retaining the failed occurrence;
+- a failed attempt after a page was already selected makes that group production-ineligible as required by document 16;
+- duplicate symbols/identities and blocking conflicts are persisted by group evaluation rather than hidden in raw metadata; and
+- a complete, normalized group is still not accepted until a successful publication attempt and atomic pointer/projection commit.
+
+---
+
+## 5. Constraint design and invariant ownership
+
+### 5.1 Constraint matrix
+
+| Invariant | PostgreSQL constraint/index | Repository transaction logic | Normalizer validation | Pipeline diagnostics |
+|---|---|---|---|---|
+| Canonical instrument symbol | Check NFKC/trim/uppercase, length 1–30, no whitespace/control; unique `(exchange_id,symbol)` | Lock/upsert both identity keys; handle unique conflict deterministically | Canonicalize and reject invalid tokens before write | Count invalid/identity conflicts; block group |
+| Optional canonical ISIN | Retained unique `(exchange_id,isin)` plus regex/check canonical ASCII form; PostgreSQL permits multiple nulls | Resolve symbol and ISIN together; never rename on conflict | NFKC/trim/uppercase and syntax validation | Blocking symbol/ISIN cross-map conflict |
+| Instrument sighting bounds | `first_seen_at IS NULL OR last_seen_at IS NULL OR first_seen_at<=last_seen_at` | Atomic min/max using authentic occurrence order | Exclude fixture/reprocessing from sightings | Report missing/legacy sighting evidence |
+| Instrument field non-erasure | FK/unique provenance shape only | Required field-aware merge and locks; DB cannot compare candidate strength | Emit origin/quality/authority | Report weaker retention and conflicts |
+| One latest projection row | Existing unique `latest_prices(instrument_id)` | Refresh complete scope with pointer under one transaction | Produce coherent candidate/revision | Compare pointer, memberships, and projection counts |
+| Latest stale/equal/new ordering | Revision uniqueness/FKs/fingerprints | Required locks, evidence tuple, occurrence order, correction history | Validate date/time sources and material fingerprint | Report conflicts, superseded, nondeterminism |
+| One daily `1d` bar | Partial unique `(instrument_id,timeframe,trading_date) WHERE timeframe='1d'` | Atomic same-date revision/projection update | Enforce adapter eligibility/finalization | Block duplicates/conflicts/unverified finalization |
+| Non-daily window identity | Partial unique timestamp key where `timeframe<>'1d'` | Future source-specific rule | Future | Future |
+| Immutable exact raw identity | Partial unique `(source_id,entity_body_sha256)` plus hash/length checks | `INSERT ... ON CONFLICT` then always insert occurrence | None before storage | Hash/body mismatch is blocking storage fault |
+| Collection occurrence identity | Unique run/request/attempt/hop and unique positive sequence | Insert every attempt/hop; sanitize first | None | Detect gaps/retry anomalies |
+| Occurrence outcome/evidence | Cross-field checks for response/failure/fixture and time/status ranges | Preserve before parse; attach correct page | No transport reinterpretation | Derive page attempt result from checked evidence |
+| One page number/offset | Two unique group-page keys plus offset check/composite ownership FK | Create expected pages before/while collecting | None | Missing/duplicate page is explicit |
+| One selected occurrence/page | Page-selection PK, unique occurrence, composite occurrence/page FK | Select first qualifying success; never rewrite | Structural pass required | Multiple successful different bodies fails page |
+| Processing-attempt idempotency | Caller-held UUID primary key and unique positive sequence | Reuse the UUID for ambiguous retry; new UUID for deliberate reprocessing; one legal finalization | Version and deterministic input/output fingerprint | Report running/interrupted/failed/partial attempts by scope |
+| Logical error identity | Exact seven-field partial/full unique key | `ON CONFLICT` and sequence-aware lifecycle | Stable stage/entity/row/rule/field/version | Scope counts to group/publication/history |
+| Error observation identity | Unique `(normalization_error_id,processing_attempt_id)` | Atomic upsert with logical error | Bounded safe message/context | Counts observations without duplicating errors |
+| Publication attempt identity | Unique run and group/stage/fingerprint/attempt | Retry only unchanged staging; retain failures | None | Expose state and safe error code |
+| One accepted current pointer | Unique scope; unique successful attempt link | Lock, validate, refresh projection, increment pointer atomically | None | Pointer/member/projection parity check |
+| Internal status vocabularies | Named checks on every target status | Enforce legal transitions | Emit only controlled codes | Unknown values are schema/data-quality failures |
+| Nonnegative canonical values | Checks on prices/OHLC/counts/volumes/amounts; signed changes exempt | Reject direct invalid writes | Exact domain validation | Aggregate violation counts |
+| Audit-safe deletion | Explicit `ON DELETE RESTRICT`/`NO ACTION` | No hard-delete workflow | None | Orphan audit query must remain zero |
+
+### 5.2 Canonical identity checks
+
+The target PostgreSQL 16 checks should be explicit and named. A representative symbol check is conceptually:
+
+```sql
+symbol = upper(btrim(normalize(symbol, NFKC)))
+AND char_length(symbol) BETWEEN 1 AND 30
+AND symbol !~ '[[:space:][:cntrl:]]'
+```
+
+The implementation migration must verify the actual PostgreSQL 16 `normalize` expression, database UTF-8 encoding, collation behavior, and SQLAlchemy/Alembic rendering before relying on it. The application canonicalizer remains mandatory. ISIN uses:
+
+```sql
+isin IS NULL OR isin ~ '^[A-Z]{2}[A-Z0-9]{9}[0-9]$'
+```
+
+Blank strings are forbidden. Checksum validation remains explicitly outside the first migration.
+
+### 5.3 Page ownership without contradictory denormalization
+
+`group_page_id` is the occurrence's canonical page ownership key. The target deliberately copies only source/run/page-limit values needed for database coherence; page number, offset, and group ID are not copied into occurrences. The mandatory chain is:
+
+```txt
+ingestion_runs UNIQUE(id, source_id)
+collection_groups FK(ingestion_run_id, source_id)
+  -> ingestion_runs(id, source_id)
+collection_groups UNIQUE(id, source_id, ingestion_run_id, page_limit)
+collection_group_pages FK(group_id, source_id, ingestion_run_id, page_limit)
+  -> collection_groups(id, source_id, ingestion_run_id, page_limit)
+collection_group_pages UNIQUE(id, source_id, ingestion_run_id)
+collection_occurrences FK(group_page_id, source_id, ingestion_run_id)
+  -> collection_group_pages(id, source_id, ingestion_run_id)
+raw_payloads UNIQUE(id, source_id)
+collection_occurrences FK(raw_payload_id, source_id)
+  -> raw_payloads(id, source_id)
+```
+
+Page number, offset, group ID, and page limit are not copied into occurrences. A selection then binds `(occurrence_id, group_page_id)` by composite FK. Direct SQL cannot mix provenance from another page.
+
+Critical normalized tuple coherence is also database-enforced where it does not violate the “one page owner” rule:
+
+- revisions use composite FKs to the same source/raw/occurrence/processing tuple;
+- latest and daily group memberships use composite revision/identity and processing-attempt/occurrence/group FKs;
+- current projections use composite membership/revision identities;
+- publication attempts use the group's exchange/dataset and the processing attempt's group;
+- the accepted pointer uses one composite FK covering attempt, scope, group, processing attempt, algorithm, and staged fingerprint.
+
+Membership occurrence/group coherence is enforced without storing `group_id` again on the occurrence: the membership's composite FK carries its occurrence and group through one processing attempt; that attempt is bound to the occurrence's page and to the same group's page. PostgreSQL integration tests attempt every cross-source/run/page/group/instrument substitution. Copied financial projection values still require repository comparison because ordinary FKs cannot compare arbitrary columns across a referenced revision.
+
+### 5.4 Immutability enforcement
+
+Unique/check/FK constraints establish identity and valid shapes but do not prevent arbitrary updates to an already valid event row. The first implementation should use:
+
+- separate migration-owner, writer, and read-only roles;
+- no `UPDATE`/`DELETE` grant on raw body, occurrence, processing, revision, membership, observation, or publication-attempt tables for the normal API role;
+- repository methods that expose insert/finalize operations rather than generic ORM mutation; and
+- PostgreSQL integration tests proving writer paths do not mutate immutable evidence.
+
+A database trigger that rejects changes to immutable columns may be added later only after its ownership, failure behavior, bulk-backfill bypass, and readiness-manifest signature are reviewed. It is not required in Phase A.
+
+### 5.5 Projection consistency
+
+PostgreSQL cannot express “all copied projection values equal the referenced revision” as a normal check constraint. Therefore:
+
+- revision and publication FKs are database-enforced;
+- complete projection refresh and pointer advancement are one repository transaction;
+- readers filter/anchor by accepted scope after activation;
+- a verification query compares every projection field and provenance FK with its revision before commit and in integration tests; and
+- diagnostics report any pointer/membership/projection count or value mismatch as a blocking invariant breach.
+
+---
+
+## 6. Exact Decimal and JSON implications
+
+### 6.1 Authoritative representation
+
+The exact `entity_body BYTEA` is the authoritative raw representation. Decoded text is a parser-version output/cache, and decoded JSON is not authoritative. The target collector stores/reuses bytes and creates the occurrence before charset decoding, `json.loads()`, shape inspection, or row counting.
+
+### 6.2 Required JSON strategy
+
+JSON source parsing must use the equivalent of:
+
+```python
+json.loads(
+    decoded_text,
+    parse_float=Decimal,
+    parse_int=int,
+    parse_constant=reject_non_finite_constant,
+)
+```
+
+`parse_float=Decimal` receives the original JSON numeric token as text. Integers remain arbitrary-precision Python integers and are converted to `Decimal` directly when a financial decimal field permits an integer token. Booleans are rejected as financial numbers despite Python's integer subclassing. `NaN`, `Infinity`, and `-Infinity` are rejected. At no point may a financial value use `float(value)`, `Decimal(float_value)`, a float-backed Pydantic coercion, or float serialization.
+
+Quoted JSON financial strings are parsed directly from their validated source text. French HTML text is normalized by the source-specific locale parser and then passed directly to `Decimal`. Null and blank remain null; they never become zero. The current ordinary `json.loads()` calls in collector, JSON parser, payload-shape logic, and diagnostics are target gaps.
+
+### 6.3 Precision and scale
+
+Current projections use:
+
+- price/change/OHLC: `NUMERIC(20,6)`;
+- percentage: `NUMERIC(12,6)`; and
+- traded value/market capitalization: `NUMERIC(24,6)`.
+
+The first target revision schema should preserve those effective limits rather than silently widen financial meaning. To make excess scale rejectable instead of letting PostgreSQL typmods round it, immutable revision columns should use unconstrained `NUMERIC` with named checks equivalent to:
+
+- price/change domain: finite, scale at most 6, absolute value below `10^14`;
+- percentage domain: finite, scale at most 6, absolute value below `10^6`;
+- amount domain: finite, scale at most 6, absolute value below `10^18`.
+
+Canonical nonnegative fields receive an additional `>=0` check. Signed `change_value` and `change_percent` do not. Repository validation must prove exact representability before copying a revision into the existing fixed-scale projection. A value with nonzero digits beyond six decimal places produces a stable precision/scale error; trailing-zero scale such as `1240.0000000000` can canonicalize exactly to six or fewer places without value loss.
+
+PostgreSQL special numeric values are rejected explicitly. The exact SQL expression for finite/precision/scale checks must be proven against PostgreSQL 16; SQLite is not sufficient. Any decision to widen scale or bounds requires explicit approval and source-data evidence.
+
+### 6.4 JSONB rules
+
+- Do not persist newly decoded source JSON in `raw_payloads.payload`; it can introduce Decimal-to-float or non-authoritative restructuring.
+- If bounded diagnostics require JSONB, convert Decimal values to the canonical decimal-string representation first, never float.
+- Safe response headers are JSON arrays of strings only and contain no financial values.
+- Quality reason codes should be a controlled sorted `TEXT[]`; arbitrary JSON ordering is not part of material identity.
+- Fingerprints are produced from the canonical protocol in document 16, not from JSONB binary layout, ORM serialization, or PostgreSQL text output.
+
+### 6.5 Required parser/storage tests
+
+Future tests must cover quoted decimals, unquoted fractions, exponents, large integers, negative zero, equivalent trailing-zero scales, French spaces/commas/percentages, null, blank aliases, booleans, non-finite constants, excessive precision/scale, and JSONB diagnostic serialization. Every test must assert `Decimal`/integer types before repository binding and exact canonical strings/fingerprints after round-trip.
+
+---
+
+## 7. Legacy-data audit plan
+
+### 7.1 Audit execution rules
+
+All pre-migration audits are read-only and run against a transactionally consistent database snapshot. They must:
+
+- record database identity, current Alembic head, query/script version, start/end time, and row counts;
+- output row IDs and safe machine issue codes, not raw bodies, header values, secrets, or unrestricted metadata;
+- use exact Decimal parsing when reparsing bodies;
+- retain a versioned reconciliation report outside runtime/public paths;
+- never update, merge, delete, or “repair” data; and
+- stop before any constraint whose input set still violates the invariant.
+
+The report format may be CSV/JSON plus a checksum, or a restricted operator schema, but a generic runtime reconciliation table is not required in the target design. If an in-database report is later chosen, its schema, retention, and role access require separate approval.
+
+### 7.2 Required audit matrix
+
+| Issue | Detection method | Severity | Must migration stop? | Possible reconciliation | Automatic reconciliation |
+|---|---|---:|---|---|---|
+| Duplicate daily bars on one date | Group `price_bars` where `timeframe='1d'` by `(instrument_id,trading_date)` with `count(*)>1`; calculate document-16 fingerprints in a read-only Decimal script | Critical for daily constraint | Yes, before daily unique index/accepted-history activation | Classify identical confirmations, proven ordered correction, or conflict; preserve all source IDs | Forbidden for differing fingerprints or unclear provenance; identical collapse still requires reviewed ID-retention policy |
+| Conflicting symbol/ISIN maps | Count distinct non-null ISINs per `(exchange_id,symbol)` and distinct symbols per `(exchange_id,isin)`; reparse supporting raw rows | Critical | Yes, before canonical identity constraint/merge activation | Confirm authoritative mapping, quarantine incoming candidate, or leave existing IDs unresolved | Forbidden |
+| Weak names overwrote descriptive names | Flag canonical `name` equal to canonical symbol or marked fallback; reparse linked/all relevant raw content for descriptive candidates | High | Yes for instrument merge activation if conflict affects active BVC rows | Restore only from proven higher-quality/higher-authority evidence with provenance; tied descriptions become conflict candidates | Forbidden unless one candidate is strictly proven by the contract |
+| Raw content reused across logical events | Expand safe arrays such as `ingestion_runs.metadata->'raw_payload_ids'`, group raw ID by distinct run; compare direct raw run/page/group metadata and `payloads_skipped` evidence | High audit gap | No for additive schema; yes before claiming complete historical occurrences/freshness | Synthesize only occurrences with complete evidence; otherwise retain legacy context as unknown | Forbidden where request/response/page identity is missing |
+| Unsafe response headers in raw metadata | Enumerate **header names only** using `jsonb_object_keys` after checking JSON shape; compare lowercase names with the seven-name allowlist and deny patterns | Critical security | No for additive schema; yes before granting production API/raw-reader roles | Copy only allowed validated values into new occurrences; separately approve legacy scrub or isolate table | Never copy unknown/denied values; deletion/scrub requires explicit approval |
+| Duplicate normalization errors | Group exact current rows, then run a prospective key derivation report by raw/stage/entity/row/rule/field/version where derivable | High | Yes before full canonical unique/not-null enforcement; no for partial new-write index | Map provable keys; preserve ambiguous legacy rows with `identity_state=legacy_unresolved` | Forbidden to merge based only on message, fragment, symbol, or status |
+| Unknown status values | Bounded distinct counts for run/raw/error/sync/quality strings and parsed source-status tokens; never treat source tokens as internal enums | High for internal status; informational for source code | Yes for unknown internal statuses before checks; no for opaque BVC source codes | Map only documented internal legacy values; preserve source codes raw/normalized and unconfirmed | Forbidden for undocumented source business meaning |
+| Invalid negative numeric values | Union ID-only checks over canonical latest/bar nonnegative fields; keep signed change/percent out | Critical | Yes before nonnegative constraints/publication | Reparse linked exact evidence; quarantine invalid canonical rows | Forbidden to clamp, absolute-value, or replace with zero |
+| Precision/scale violations | Inspect canonical columns and reparse raw numeric tokens with `Decimal`; check target bounds/scale before binding | High | Yes before revision backfill/target checks | Preserve raw token; accept only exact representable canonical value or quarantine | Forbidden to round nonzero excess digits silently |
+| Missing provenance | Find instruments/latest/bars/errors with missing source/raw IDs; validate referenced raw row/source consistency | High | Yes before treating a row as accepted; no for retaining it as legacy-unverified | Attach only proven FKs from deterministic source evidence; otherwise retain unknown | Forbidden to use nearest timestamp/run as a guess |
+| Ambiguous source timestamp/trading date | Flag metadata policies using collection fallback, missing/naive source timestamps, source date/timestamp disagreement, and Casablanca boundary ambiguity | Critical for publication | Yes before seeding accepted revisions | Reparse exact payload with versioned timezone rule; otherwise legacy-unverified | Forbidden to use processing time/current time as market time |
+| Legacy raw status cannot map safely | Count raw status and metadata combinations; compare body presence and parser metadata without assuming success | High | Yes before status check/backfill attempt assertions | Preserve content; use no processing attempt or explicitly `legacy_unresolved` audit state | Forbidden to convert `normalized` into proof of group acceptance/publication |
+| Body/hash inconsistency | Recompute the **legacy** documented URL/text hash where text/URL exist; separately inventory body-null rows | High | Yes before freezing legacy context; not proof of exact-byte identity | Preserve original hash and mark evidence kind; investigate corruption | Forbidden to replace the old hash with a re-encoded “exact” hash |
+| Page/group metadata contradiction | Compare page number/offset/limit/group IDs across raw and run metadata; find duplicate page/offset and gaps | Critical for completeness | Yes before backfilling a complete group | Backfill validation-only group when every field is corroborated; otherwise unknown | Forbidden to infer missing pages or completion from max stored page |
+| Latest projection conflicts with raw evidence | Reparse linked content and compare exact material fields/date/time/provenance with `latest_prices` | Critical | Yes before accepted projection activation | Seed only `legacy_projection_snapshot` revision; corrected acceptance requires a new qualified group | Forbidden to declare it accepted based on current row alone |
+| Orphaned or mismatched FKs | Left joins for every BVC audit FK and source/raw consistency checks | Critical | Yes | Restore only from backups/proven evidence; otherwise quarantine | Forbidden to delete orphaned evidence |
+
+### 7.3 Representative read-only query shapes
+
+These are planning sketches, not migration code:
+
+```sql
+-- Same-date daily duplicates.
+SELECT instrument_id, trading_date, count(*) AS row_count,
+       array_agg(id ORDER BY bar_timestamp, id) AS row_ids
+FROM price_bars
+WHERE timeframe = '1d'
+GROUP BY instrument_id, trading_date
+HAVING count(*) > 1;
+
+-- Conceptual query over the read-only audit script's in-memory parsed candidate
+-- stream, NOT only the already-unique instruments table.
+SELECT exchange_id, canonical_symbol, count(DISTINCT canonical_isin) AS isin_count
+FROM audit_parsed_instrument_candidates
+WHERE canonical_isin IS NOT NULL
+GROUP BY exchange_id, canonical_symbol
+HAVING count(DISTINCT canonical_isin) > 1;
+
+SELECT exchange_id, canonical_isin, count(DISTINCT canonical_symbol) AS symbol_count
+FROM audit_parsed_instrument_candidates
+WHERE canonical_isin IS NOT NULL
+GROUP BY exchange_id, canonical_isin
+HAVING count(DISTINCT canonical_symbol) > 1;
+
+-- Potential symbol-as-name fallback; source reparse decides whether a richer value exists.
+SELECT id, exchange_id, symbol, raw_payload_id
+FROM instruments
+WHERE upper(btrim(name)) = upper(btrim(symbol));
+
+-- Daily/canonical numeric negatives; expand to every nonnegative target field.
+SELECT id, instrument_id, 'latest_prices.price' AS field_name
+FROM latest_prices WHERE price < 0
+UNION ALL
+SELECT id, instrument_id, 'price_bars.close_price'
+FROM price_bars WHERE close_price < 0;
+
+-- Missing primary provenance.
+SELECT 'latest_prices' AS relation, id
+FROM latest_prices
+WHERE source_id IS NULL OR raw_payload_id IS NULL
+UNION ALL
+SELECT 'price_bars', id
+FROM price_bars
+WHERE source_id IS NULL OR raw_payload_id IS NULL;
+```
+
+`audit_parsed_instrument_candidates` above is a conceptual in-memory relation emitted by a read-only parser script; the audit does not create a temporary database table. The current exact unique constraints make direct same-key conflict queries over `instruments` unable to recover most historical candidate conflicts. Queries over `instruments` are still useful for normalized case/whitespace collisions and current-row consistency, but preserved raw evidence is required for historical symbol/ISIN/name candidates.
+
+The raw reuse and header audits must first validate JSONB shape. Header reports emit normalized names/counts only; operational logs must not print values. Fingerprint and precision audits belong in a versioned read-only script using the same canonical Decimal implementation intended for production, not ad hoc SQL concatenation.
+
+### 7.4 Stop-the-line policy
+
+Phase D cannot proceed for an invariant while its critical/high blocking report is nonempty. It is valid to continue additive work on unrelated tables, but the migration report must show each invariant as `pass`, `blocked`, or `not_applicable`. “No rows returned” is evidence only when the audit query version and database snapshot are recorded.
+
+---
+
+## 8. Backfill policy
+
+### 8.1 Evidence rules
+
+Backfill preserves what is known and makes unknowns explicit:
+
+- do not invent collection occurrences, source observation times, page selections, or publication acceptance;
+- do not use `created_at`, processing time, normalized time, migration time, or current time as a market timestamp;
+- do not silently delete or merge duplicate/conflicting rows;
+- preserve current IDs wherever the target row represents the same logical object;
+- preserve raw bodies and current hashes exactly;
+- record evidence class and migration/report version for every derived legacy target row; and
+- keep every quarantined conflict in the reconciliation report with its source IDs.
+
+### 8.2 Raw-content backfill
+
+For each current `raw_payloads` row:
+
+1. Preserve `id`, `source_id`, `payload_text`, `payload`, `payload_hash`, and all legacy context unchanged.
+2. Record `legacy_hash_algorithm='sha256_source_url_normalized_text_v1'` only when the current code path can be proven for that row; otherwise record `unknown_legacy`.
+3. Set `content_evidence_kind` to `legacy_decoded_text`, `legacy_jsonb_only`, or `legacy_body_missing` according to stored evidence.
+4. Leave `entity_body`, `entity_body_sha256`, and exact length null unless independent stored bytes prove them. UTF-8 re-encoding decoded text is not the original pre-charset entity body and must not be labeled exact.
+5. Freeze legacy contextual columns after dual-write cutover. Do not copy unrestricted headers to new target storage.
+
+Newly collected responses use `exact_entity_bytes` and never the legacy hash as content identity.
+
+### 8.3 Occurrence/group backfill
+
+The current database generally lacks per-request start time, retry number, redirect hop, exact response time, and immutable page ownership. Therefore no conforming occurrence is synthesized merely because a raw row has `collected_at` and a run FK.
+
+A limited legacy occurrence may be created only when all fields required by one contract outcome are independently evidenced. For example, an external archived trace might prove request time, response time/status/URL, run, and page ownership. Its `collection_mode` remains `backfill`, and it is production-ineligible unless a separately approved replay contract says otherwise.
+
+Current fixture rows likewise retain their load context, but missing attempt-start/finish evidence is not invented. Raw/run metadata may support a validation-only group summary, but:
+
+- `max(stored page)` is not expected page count;
+- `status='normalized'` is not processing-attempt evidence;
+- a raw metadata group ID is not immutable sequence/order proof; and
+- no legacy group becomes the accepted production pointer.
+
+### 8.4 Instrument backfill
+
+- Canonicalize symbol/ISIN in an audit projection first; do not update until conflicts are empty or reviewed.
+- Do not set `first_seen_at=created_at`. Persistence time is not source sighting time.
+- Preserve current `last_seen_at` only as `legacy_unverified` unless its authentic source occurrence is proven.
+- Create current field-provenance rows only for fields whose source/raw tuple and candidate are unambiguous **and** through a real, recorded `backfill` or `replay` processing attempt. The attempt may describe deterministic migration work, but it may not claim a historical collection occurrence or observation time. If that processing evidence is not created, leave field provenance absent; missing per-field provenance remains explicit and makes instrument-master completeness unknown.
+- A current descriptive name can remain canonical if unchallenged, but it is not retroactively assigned a fabricated authority/occurrence.
+- Same-authority candidate conflicts are materialized only from preserved evidence; otherwise report them and leave unresolved.
+
+### 8.5 Latest-price backfill
+
+An existing `latest_prices` row with proven source/raw provenance may be copied to one immutable revision with:
+
+```txt
+evidence_state = legacy_projection_snapshot
+collection_occurrence_id = null
+processing_attempt_id = null
+group membership = none
+accepted pointer = none
+```
+
+The row's current source/raw data and material values are preserved, but no lost prior revisions are reconstructed. If timestamp/trading-date source or selected price field cannot be proved, those facts remain `unknown_legacy` on the legacy projection/reconciliation report; because the contract fingerprint cannot then be formed without inventing a field, do not create even the legacy revision. In every case, legacy state cannot seed accepted publication.
+
+The existing projection may continue serving compatibility traffic until Phase E. The first accepted snapshot must come from a newly qualified complete group processed by the target pipeline.
+
+### 8.6 Daily-bar backfill
+
+Every existing `1d` row starts as `legacy_unverified`, not provisional or final. A single row does not prove source aggregate eligibility or finalization. Duplicate same-date rows remain in place until the audit classifies them. No automatic “latest timestamp wins” rule is allowed.
+
+Only source evidence satisfying the future approved daily contract may create final revisions/publication memberships. If that evidence never exists, legacy bars remain quarantined from ordinary accepted history. Existing IDs should be retained for whichever projection row is later proven canonical; other rows remain preserved until a separately approved archival/deprecation migration.
+
+### 8.7 Normalization-error backfill
+
+- `open` may map to `active`, `fixed` to `resolved`, and `ignored` to `ignored` only with `identity_state='legacy_unresolved'` unless the full logical key and resolution evidence are proven.
+- Do not infer `row_locator` from symbol/name/fragment alone.
+- Do not call the current `error_type` a stable `rule_code` without a reviewed deterministic mapping/version.
+- Do not fabricate processing attempts or observations from row creation time.
+- Exact duplicate-looking legacy rows remain separate until their identities are proven; the report records them.
+- Unknown statuses stop lifecycle checks.
+
+### 8.8 Reconciliation report retention
+
+For every unresolved item, retain:
+
+```txt
+database snapshot identifier
+migration/audit version
+relation and row ID(s)
+safe issue code and severity
+which evidence is missing or contradictory
+candidate reconciliation choices
+reviewer decision, when one exists
+resulting target IDs, when later migrated
+report checksum and timestamps
+```
+
+No report contains raw bodies, header values, credentials, private URLs, or unrestricted exception text.
+
+---
+
+## 9. Phased migration sequence
+
+The phases are conceptual gates, not a demand for one large Alembic file per phase. Each phase should be split into small, forward-only revisions with explicit dependency and verification. PostgreSQL `CHECK`/FK validation and concurrent index construction must use Alembic patterns appropriate to transaction boundaries; SQLite `create_all()` is not migration evidence.
+
+### Phase A — Additive audit foundation
+
+**Objectives**
+
+- Introduce target objects without changing current reads/writes.
+- Make exact content, occurrence, group/page, processing, and event ordering representable.
+- Avoid locks/rewrite-heavy destructive changes.
+
+**Schema changes**
+
+- Add nullable/transitional columns to `ingestion_runs`, `raw_payloads`, `instruments`, `latest_prices`, `price_bars`, and `normalization_errors`.
+- Add `collection_groups`, `collection_group_pages`, `collection_occurrences`, `collection_page_selections`, and `processing_attempts`.
+- Add instrument provenance/conflict tables, latest-price revisions/memberships, error observations, publication attempts, and accepted pointers.
+- Create only constraints that all current data trivially satisfies; add other checks as `NOT VALID` where PostgreSQL permits.
+- Daily revision/membership tables may be omitted from the first additive train because their business semantics are deferred.
+
+**Data operations**
+
+- None beyond safe defaults/evidence-state labels that do not reinterpret history.
+
+**Verification**
+
+- Fresh `alembic upgrade head` on PostgreSQL 16.
+- Upgrade from a schema at `0001_initial_foundation` with representative data.
+- Catalog comparison for every new column/key/FK/index and retained old object.
+- Confirm current application tests/queries still work with no behavior switch.
+
+**Rollback limitations**
+
+- Dropping empty additive objects is technically possible before use, but downgrade is not the preferred production recovery.
+- Once new event rows exist, downgrading would discard audit evidence and is prohibited without export/approval.
+
+**Acceptance criteria**
+
+- No current row is deleted or rewritten.
+- Existing API/repositories remain compatible.
+- New audit schema can represent every contract outcome.
+- PostgreSQL migration tests pass.
+
+**Out of scope:** collector dual-write, publication activation, scheduler, daily-bar semantics, API response changes, legacy cleanup.
+
+### Phase B — Backfill and audit
+
+**Objectives**
+
+- Inventory every legacy violation.
+- Copy only supported evidence and label unknown facts.
+- Produce a durable reconciliation report before hard constraints.
+
+**Schema/data operations**
+
+- Populate legacy evidence-state/hash-algorithm fields.
+- Map a run role only where collector/run metadata proves it; otherwise use transitional `legacy_unclassified`. Do not synthesize a run-order sequence.
+- Backfill canonical identity/provenance and legacy revision snapshots only when rules in section 8 pass.
+- Leave unsupported occurrence/group/processing/publication history absent.
+- Do not delete or merge duplicates.
+
+**Verification queries**
+
+- Run every section 7 audit and reconcile totals with source tables.
+- Confirm raw IDs/bodies/hashes are unchanged.
+- Confirm no accepted pointer or accepted-final bar membership was synthesized.
+- Confirm every derived target row links to a report entry and proven source row.
+
+**Rollback limitations**
+
+- Backfilled rows can be identified by migration/evidence state, but deleting them after downstream references exist would lose audit links.
+- Correct mistakes with a forward corrective migration/report, not destructive downgrade.
+
+**Acceptance criteria**
+
+- Every audit is `pass`, `blocked`, or explicitly `not_applicable`.
+- Counts and checksums are recorded.
+- Unknown facts remain null/legacy-unresolved.
+- Blocking conflicts prevent only their dependent later gates; nothing is silently reconciled.
+
+**Out of scope:** mutation-based reconciliation, header scrub/deletion, runtime dual-write, production acceptance.
+
+### Phase C — Dual-write preparation and validation
+
+**Objectives**
+
+- Allow repositories/collector/pipeline to write target evidence while legacy behavior remains available.
+- Compare target results without exposing them as accepted production data.
+
+**Schema/runtime changes for future missions**
+
+- Store exact bytes before parse; atomically deduplicate content and always insert an occurrence.
+- Persist groups/pages/selections and immutable processing attempts.
+- Use deterministic instrument merge/provenance/conflict logic.
+- Stage latest revisions and complete group memberships.
+- Write canonical logical errors and observations.
+- Continue legacy projection writes only behind an explicit compatibility path; target publication pointer stays inactive.
+- Disable legacy BVC daily-bar writes unless the daily contract has been independently approved and implemented.
+
+**Data operations**
+
+- Generate shadow/staged target records from controlled fixtures and safe non-live reprocessing.
+- Do not mark them accepted production merely because shadow comparison passes.
+
+**Verification queries/tests**
+
+- Compare row-level material fingerprints, counts, page coverage, errors, and group results between paths.
+- Prove repeat processing creates no duplicate target revisions/errors.
+- Fault-inject transaction failures and prove raw/occurrence/processing audit remains coherent.
+- Prove unsafe headers never enter target occurrence storage.
+
+**Rollback limitations**
+
+- Feature behavior can return to legacy reads, but target audit rows must remain.
+- A dual-write defect is corrected forward; do not erase evidence.
+
+**Acceptance criteria**
+
+- Target writes are deterministic under repeat and reverse order.
+- No accepted pointer is advanced.
+- All PostgreSQL concurrency tests for introduced writes pass.
+- Legacy and target differences are explained by approved contract changes, not hidden.
+
+**Out of scope:** scheduler, production publication, API freshness switch, daily final history.
+
+### Phase D — Constraint enforcement
+
+**Objectives**
+
+- Turn audited invariants into validated PostgreSQL backstops.
+- Remove race windows from target writers.
+
+**Schema changes**
+
+- Validate canonical symbol/ISIN, status, timestamp, outcome/evidence, numeric, and FK checks.
+- Build unique indexes only after violation reports are empty; use concurrent construction where operationally appropriate, then attach constraints when possible.
+- Make native target fields non-null while preserving an explicit transitional path for unresolved legacy rows.
+- Add daily identity constraints only if daily-bar implementation is separately approved and its audit passes.
+
+**Data operations**
+
+- Only reviewed reconciliations from the signed report. No inline migration guesswork.
+
+**Verification queries/tests**
+
+- Re-run audits under a consistent snapshot.
+- Direct SQL negative tests for each named constraint.
+- Two-connection race tests for all uniqueness/conflict paths.
+- Catalog signatures match the draft readiness manifest.
+
+**Rollback limitations**
+
+- Dropping a constraint can restore old invalid-write capability but does not reverse reconciled data.
+- If validation fails, stop the phase and keep the `NOT VALID`/additive state; do not weaken the invariant.
+
+**Acceptance criteria**
+
+- Every activated invariant is enforced by PostgreSQL and exercised by integration tests.
+- No canonical new-write path uses legacy-unresolved sentinels.
+- Repository conflict handling converts expected races into deterministic outcomes.
+
+**Out of scope:** scheduler, accepted publication activation, legacy column deletion.
+
+### Phase E — Publication model and safe API activation
+
+**Objectives**
+
+- Make complete groups the only source of current published BVC prices.
+- Refresh the accepted projection and pointer atomically.
+- Make freshness/diagnostics occurrence/group/publication-based and least-privilege.
+
+**Schema/runtime changes for future missions**
+
+- Activate publication attempts, complete membership staging, pointer locking/versioning, and one-transaction projection refresh.
+- Create/sign `v_bvc_operational_diagnostics` and the packaged role-specific readiness manifest.
+- Add API/collector role grants; deny API direct raw-body/header access.
+- Switch BVC repositories to accepted projection/pointer semantics and controlled schema-not-ready behavior.
+- Establish the first accepted pointer only from a new qualified complete group, never legacy backfill.
+
+**Data operations**
+
+- Run one controlled non-scheduled qualification/publication workflow using approved evidence.
+- Preserve the pre-activation legacy projection until cutover verification completes.
+
+**Verification queries/tests**
+
+- Pointer, membership, projection count/value parity.
+- Concurrent readers see only old or new complete snapshot during publication.
+- Failure before pointer commit rolls back projection and pointer.
+- API role cannot select bodies/headers or write any application table.
+- Freshness returns distinct attempt, acquisition, processing, accepted, and market times.
+
+**Rollback limitations**
+
+- Do not Alembic-downgrade publication history.
+- Operational rollback may atomically repoint/rebuild only to a previously accepted complete staged set under a separately tested rollback procedure; manually editing prices is forbidden.
+
+**Acceptance criteria**
+
+- No partial/ineligible group changes public current data.
+- Failed publication retains prior pointer/projection.
+- API compatibility and new freshness/readiness tests pass on PostgreSQL.
+- Least-privilege and view-signature checks pass.
+
+**Out of scope:** scheduler, final daily-bar publication unless separately approved, SLA/calendar implementation.
+
+### Phase F — Legacy-field deprecation
+
+**Objectives**
+
+- Stop relying on mixed raw context, mutable raw status, legacy projection metadata, and old dedup keys.
+- Reduce privileges and compatibility code only after sustained validation.
+
+**Schema/runtime changes**
+
+- Stop all writes to legacy raw context/status/body-decode columns.
+- Remove old repository paths and redundant indexes after query-plan review.
+- Mark legacy columns deprecated in manifest/API internals.
+- Consider column/table removal only in separate explicitly approved migrations.
+
+**Data operations**
+
+- None destructive in this phase by default.
+- Any unsafe-header scrub, unresolved-error archive, duplicate-bar archive, or body relocation requires its own approved plan and reconciliation proof.
+
+**Verification**
+
+- Search runtime SQL/ORM access for deprecated columns.
+- Observe at least one agreed validation window with zero legacy writes.
+- Verify backups/restore and audit-query continuity.
+
+**Rollback limitations**
+
+- Code can temporarily read retained legacy columns during the compatibility window.
+- Once separately approved deletion occurs, rollback requires backup restoration; therefore deletion is not part of this plan.
+
+**Acceptance criteria**
+
+- Target evidence and publication paths are the sole authority.
+- No readiness/API role depends on unsafe legacy columns.
+- No data has been silently discarded.
+
+**Out of scope:** immediate column deletion, unrelated foundation cleanup, new sources/data types, scheduler design.
+
+---
+
+## 10. Minimal implementation path
+
+### 10.1 Classification
+
+| Proposed change | Classification | Reason |
+|---|---|---|
+| Exact-byte columns and exact raw uniqueness | Required before scheduler | Unattended collection must not lose or misidentify content |
+| Collection groups/pages/occurrences/selections and evidence checks | Required before scheduler | Retry, failure, pagination, completeness, and freshness evidence must survive every attempt |
+| Safe-header filtering/storage schema | Required before scheduler | Current collector can persist cookies/WAF/session headers |
+| Immutable processing attempts | Required before scheduler | Reprocessing/rule versions and page/group outcomes cannot mutate content state |
+| Deterministic instrument merge, current field provenance, name conflicts | Required before scheduler | Automated weak/older rows can currently regress the master |
+| Latest-price revisions, complete group memberships, publication attempts, accepted pointer, atomic projection refresh | Required before scheduler | Current per-page writes can expose mixed or stale snapshots |
+| Canonical normalization-error key and observations | Required before scheduler | Concurrent/repeated unattended runs otherwise duplicate or hide error evidence |
+| Run roles/status checks and core PostgreSQL constraints/concurrency tests | Required before scheduler | End-to-end success and race behavior must be deterministic; event ordering uses the dedicated group/attempt sequences |
+| Explicitly disable legacy daily-bar writes from unverified BVC adapters | Required before scheduler | Deferral is safe only if automation cannot continue producing unverified `1d` bars |
+| Full API diagnostics safe view and read-only role | Required before production API | Response redaction alone does not prevent raw-table access |
+| Packaged API-role readiness manifest and controlled 503 behavior | Required before production API | A matching schema/permissions contract must be verified fail-closed |
+| Collector-role schema manifest/head guard | Required before scheduler activation | Automated writes must not run against an incompatible schema; it may be smaller than the API manifest |
+| Daily-bar revisions/group/publication memberships and daily unique index | Required later | Required before any BVC daily-bar automation/publication, but not before price-snapshot scheduling if bar writes are disabled |
+| Historical SLA/calendar/finalized-through logic | Required before production historical freshness claims | No current authoritative calendar/finalization policy exists |
+| Legacy unsafe-header scrub | Required before granting any role access that could expose legacy metadata | Existing values must be isolated or scrubbed under explicit approval |
+| Full immutable instrument-field revision history | Optional | Current provenance plus raw/occurrence evidence satisfies the approved immediate contract; add only for a proven audit need |
+| Dedicated source-external-instrument mapping table | Optional/required later if a stable external ID is confirmed | Avoid metadata identity without inventing an ID |
+| Object storage for raw bytes | Optional later | PostgreSQL `BYTEA` is the selected initial BVC-slice design; revisit only with size/retention evidence |
+| `sync_states` redesign | Optional | It is not authoritative and should not block the BVC target |
+
+### 10.2 Smallest safe pre-scheduler subset
+
+The smallest subset is not the entire long-term daily-history design. It is:
+
+1. PostgreSQL migration/integration-test harness and read-only legacy audits.
+2. Exact raw content plus occurrence/group/page/selection storage and safe headers.
+3. Immutable processing attempts and canonical error observations.
+4. Field-aware instrument merge/provenance/conflicts.
+5. Immutable latest-price revisions, complete group memberships, publication attempts, one pointer, and atomic `latest_prices` projection refresh.
+6. Validated constraints and collector-role schema compatibility checks.
+7. A hard runtime gate preventing the unverified legacy daily-bar write path.
+
+Only after this subset passes controlled fixture/replay and PostgreSQL concurrency/fault tests is scheduler implementation safe to begin. The full daily-bar revision/publication design, public-history freshness, and optional provenance history do not need to block price-snapshot scheduling when bar writes are off.
+
+---
+
+## 11. PostgreSQL test strategy
+
+### 11.1 Test tiers
+
+The future test suite needs two complementary tiers:
+
+1. **Fast SQLite/unit tests:** pure parsing, canonicalization, fingerprinting, deterministic decision helpers, response serialization, and simple route validation.
+2. **PostgreSQL 16 integration tests:** Alembic upgrades, catalog signatures, partial/expression uniqueness, `NUMERIC`, JSONB, timestamptz/timezone behavior, foreign keys, roles/grants, locking, `ON CONFLICT`, isolation, concurrency, and atomic publication.
+
+`Base.metadata.create_all()` is not a substitute for either a fresh Alembic migration test or a legacy upgrade test.
+
+### 11.2 Required PostgreSQL cases
+
+| Area | Required future test |
+|---|---|
+| Fresh schema | Create an empty PostgreSQL database, run Alembic from base to head, compare catalog signatures to ORM and manifest, and run API smoke queries with no data |
+| Representative legacy upgrade | Load a `0001_initial_foundation` fixture containing clean rows plus every audit edge class; run each phased migration and prove no IDs/bodies are lost |
+| Re-run/idempotency | Re-run upgrade/backfill commands where supported; no duplicate event/revision/error rows and no reinterpreted evidence |
+| Constraint enforcement | Direct SQL attempts violate each named symbol/ISIN/status/time/outcome/page/numeric/FK constraint and fail with the expected constraint name |
+| Concurrent instrument creation | Two independent transactions create/match same symbol/ISIN, weak/rich names, and tied conflicts in both orders; converge deterministically |
+| Concurrent raw deduplication | Two transactions insert the same exact body/source; one content row survives and both valid collection occurrences survive |
+| Occurrence insertion | Every success/redirect/HTTP error/transport failure/fixture evidence shape is accepted; every contradictory shape is rejected |
+| Page ownership/selection | Cross-group/page composite FK attempts fail; retries select only the first qualifying success; different successful bodies fail the page |
+| Daily identity | Same instrument/date with different intraday timestamps cannot create two `1d` projections; non-daily timeframes retain separate timestamp identity |
+| Latest write ordering | Older/newer date, direct/fallback rank, older/equal/newer timestamp, identical confirmation, equal-time correction, cross-source conflict, and reverse order produce contract results |
+| Revision fingerprint | Equivalent Decimal scales/timezones/UUIDs/reason order reuse one revision; every material field/version change creates a distinct fingerprint |
+| Revision/supersession lineage | Direct SQL cannot link a latest revision to another instrument, a daily revision/membership to another instrument/date, or a publication retry to another scope/group/fingerprint; repository tests reject self-cycles, longer cycles, skipped retry numbers, and branches |
+| Error concurrency | Concurrent same-key emissions converge to one logical error and idempotent observations; out-of-order clocks choose first/latest by processing sequence |
+| Error evidence coherence | Direct SQL cannot connect an error for one source/raw content tuple to a processing attempt for another tuple |
+| Error lifecycle | Clean complete retry resolves; partial omission does not; recurrence sequence rules deterministically reopen or preserve resolution |
+| Publication pointer atomicity | Concurrent publishers for one scope serialize; pointer version increments; members/projection/pointer are consistent |
+| Publication pointer eligibility | Direct SQL cannot point at a running/failed attempt, a `daily_history` attempt, or an attempt from another source/scope/group/staged fingerprint |
+| Rollback on partial failure | Fault after revision staging, mid-projection refresh, and before pointer update; accepted pointer/projection remain wholly prior and failed attempt is retained safely |
+| Reader isolation | A concurrent API reader sees only the prior or new complete accepted snapshot, never a mixed set |
+| Daily publication | When later approved, only final revisions enter accepted membership/projection; provisional rows remain excluded |
+| API role permissions | API role can read approved canonical objects/view and catalog probes, but cannot write, own objects, select raw bodies/headers, inherit writer power, or use forbidden `PUBLIC` grants |
+| Safe diagnostics view | Definition/options/owner/dependency/output signatures match manifest; aggregates remain bounded and contain no raw/header fields |
+| Schema readiness | Missing Alembic table; behind/ahead/multiple head; changed same-named constraint/view; missing grant; excess direct/inherited/ownership privilege; and exact-ready state produce stable results |
+| Timezone | Casablanca trading dates/anchors and UTC API output are correct across offsets and timezone-boundary cases |
+| Numeric | Excess scale/precision, non-finite values, negatives, exact exponent input, and projection round-trip behave without binary float or silent rounding |
+
+Concurrency tests must use separate connections and explicit synchronization barriers; sequential calls in one session do not prove races. Publication tests should use the intended isolation/row-lock strategy and a bounded retry policy for serialization/deadlock failures.
+
+### 11.3 Existing SQLite tests that remain useful
+
+The current 92-test suite remains valuable for:
+
+- collector URL/config/retry decision helpers with `httpx.MockTransport`;
+- JSON alias null/blank fallback and HTML French-number/date parsing;
+- diagnostics shape and pure page/group decision helpers once separated from persistence;
+- exact Decimal-as-string API serialization;
+- query/path validation, pagination response shape, 404/422 behavior, and body/metadata redaction;
+- pure material-fingerprint and merge-order tests; and
+- simple happy-path repository behavior where no PostgreSQL-specific claim is made.
+
+These tests currently all use SQLite metadata creation for database behavior. They cannot prove partial/`NULLS NOT DISTINCT` uniqueness, PostgreSQL locking/`ON CONFLICT`, numeric coercion, JSONB rules, timestamptz semantics, FK enforcement, roles, view security, catalog readiness, or Alembic upgrade safety.
+
+### 11.4 Legacy expectations that must not define target behavior
+
+Later implementation must intentionally revise tests that currently expect:
+
+- no raw row for a terminal HTTP 500 response;
+- an empty later response to be discarded;
+- `max_pages` to report successful completion without authoritative total evidence;
+- duplicate collection to produce one raw row with no new occurrence;
+- fixture reprocessing to stand in for a new collection attempt;
+- `N.T`/`S` plus `coursCourant` to create a `1d` bar;
+- fixture/unknown-date collection time to become market timestamp/date;
+- each intraday source timestamp to create a separate `1d` bar; or
+- mutable raw metadata to be the group/normalization source of truth.
+
+Those assertions accurately describe legacy behavior but conflict with document 16. They must be replaced with target tests, not weakened or silently retained.
+
+### 11.5 Migration-test fixtures
+
+At minimum, the representative `0001` fixture must include:
+
+- clean and conflicting instrument keys/names;
+- null and present ISINs;
+- duplicate same-date bars with identical and differing material values;
+- latest rows with direct and collection-fallback timestamp metadata;
+- raw text/JSON/null-body variants, duplicate run references, unrestricted header names, and inconsistent page metadata;
+- duplicate-looking and unmappable normalization errors;
+- every current internal status plus an unknown status; and
+- null provenance and boundary numeric rows.
+
+Fixture data must be synthetic and contain no copied cookies, tokens, WAF identifiers, private URLs, or production raw payloads.
+
+---
+
+## 12. API compatibility implications
+
+### 12.1 Endpoint matrix
+
+| Current endpoint | Current schema assumption | Target effect | Compatibility decision |
+|---|---|---|---|
+| `GET /api/v1/markets/bvc/instruments` | Direct `instruments`, symbol-order pagination, page-count `count` | Same master table; canonical/conflict/provenance state improves | Route, query fields, item fields, page-count meaning, and Decimal behavior can remain; future provenance/conflict fields are additive or versioned |
+| `GET /api/v1/markets/bvc/latest-prices` | Direct one-row `latest_prices`; freshness from latest raw row/current max prices | Reads accepted projection anchored to pointer; occurrence/group/publication freshness | Item fields can remain; freshness semantic/shape change should be versioned or explicitly semantics-versioned rather than silently redefining old fields |
+| `GET /api/v1/markets/bvc/instruments/{symbol}` | Instrument plus direct latest row; 404 on missing symbol | Same canonical instrument plus accepted latest projection | Existing item and 404 behavior can remain; conflict/provenance/freshness additions need an additive/versioned contract |
+| `GET /api/v1/markets/bvc/instruments/{symbol}/price-bars` | All timestamp-keyed bars, only `1d`, no state filter | Eventually accepted final daily projection only | Filtering out provisional/legacy-unverified data is a material semantic change; introduce a versioned/semantics-versioned response with bar state/provenance before activation |
+| `GET /api/v1/markets/bvc/diagnostics/summary` | Reconstructs groups from all raw rows/metadata; hardcoded obsolete blocker | Reads safe bounded diagnostics view with explicit scopes/states | Requires a versioned diagnostics schema or clearly deprecated legacy fields; do not silently reuse ambiguous names |
+| `GET /health` | `SELECT 1` means healthy | Aggregate application readiness, 503 on missing/incompatible schema | Preserve familiar top-level service/environment keys if useful, add component/reason fields, and document changed readiness meaning; add separate dependency-free liveness route |
+
+### 12.2 Fields that can stay backward-compatible
+
+- Instrument IDs, symbols, ISINs, names, types, currency, activity, and existing item route paths.
+- Latest-price financial field names, market timestamp/date fields, source ID, quality status, and exact decimal strings.
+- Price-bar OHLCV field names and deterministic `bar_timestamp`, once rows are accepted final.
+- `limit`, `offset`, existing filters, page-length `count`, 404 for missing instrument, and 422 validation behavior.
+- Public omission of raw bodies, header values, raw fragments, and unrestricted metadata.
+
+The current API's `price or "0"`/`close_price or "0"` fallback must not be relied upon in a nullable transition. Target projections keep required prices non-null; otherwise the API must fail safely rather than fabricate zero.
+
+### 12.3 Fields that need additive or versioned semantics
+
+Current `BvcFreshness` has only `latest_collected_at`, `latest_price_timestamp`, and `latest_trading_date`. The first is currently the newest deduplicated raw-content row, which is not document 16's latest collected occurrence or accepted collection freshness. A safe transition is one of:
+
+1. introduce a versioned response containing separate operational, acquisition, processing, current-publication, and market freshness; or
+2. add an explicit `freshness_semantics_version`, retain the old raw-based field under a clearly legacy name temporarily, and add the canonical terms without silently changing the old field.
+
+The versioned target must distinguish latest attempt, collected response, successful collection, normalized attempt/group, complete group, accepted group, accepted collection time, price timestamp/date, stale dimensions, and incomplete data. Symbol-filtered responses must declare whether freshness is instrument or market scope.
+
+Diagnostics similarly need group sequences, selected pages, completeness/coverage, processing revision, publication attempt/pointer, scoped error counts, and safe status/selected-price aggregates. Existing hardcoded `scheduler_blocked` and timeout text are not schema truth and must be removed in a later API mission.
+
+Price-bar responses eventually need at least publication/final state and provenance semantics. An explicitly authorized preview is a separate scope and labels provisional rows/incompleteness; ordinary history never exposes them.
+
+### 12.4 Error/readiness behavior
+
+The five dimensions remain independent:
+
+| Dimension | Exact target question | Database work | Effect on application readiness |
+|---|---|---|---|
+| Liveness | Can this process answer a local request? | None; no session is created | Required; dependency-free endpoint returns 200 while process is responsive |
+| Database connectivity | Can the configured role obtain a connection and run one bounded read-only probe? | Short-timeout `SELECT 1` | Required, but says nothing about schema/data |
+| Schema readiness | Does Alembic head, the packaged manifest, complete object signatures, and effective role policy match this build? | Read-only Alembic/catalog/privilege probes | Required; mismatch is controlled not-ready |
+| Application readiness | Can this deployed role safely serve its configured function now? | Aggregates configuration, connectivity, schema, and required dependencies | `/health` returns 200 only here; no BVC network call is required |
+| Data freshness | Is accepted data available, complete, and recent under the endpoint policy? | Read accepted occurrence/group/processing/publication evidence | Not a general readiness dependency; empty/stale/incomplete data remains explicit domain state |
+
+A migrated empty database can therefore be application-ready while `data_available=false`, stale state is unknown, and current-snapshot data is incomplete. A stale accepted group or a newer failed group also does not make the API process unready. If schema readiness is false, freshness is `unavailable` and normalized routes must not query missing objects.
+
+When PostgreSQL is reachable but migrations/tables/constraints/grants do not match the build:
+
+- liveness remains 200;
+- `/health` aggregate readiness returns controlled 503;
+- normalized BVC endpoints return controlled 503 with stable `schema_not_ready` detail;
+- no route runs migrations or `create_all`; and
+- no SQL text, database URL, stack, raw body, or header data leaks.
+
+A correctly migrated empty database is ready and returns empty normalized collections with explicit `data_available=false`/unknown freshness, not a schema failure.
+
+### 12.5 Read-role transition
+
+The current diagnostics repository loads full `RawPayload` ORM rows, so response redaction alone is insufficient. Before production role activation:
+
+- API reads current projections, safe reference tables, pointer/membership facts, and `v_bvc_operational_diagnostics` only;
+- direct `SELECT` on raw body/text/decoded JSON and occurrence safe-header columns is denied;
+- API has no sequence/write/schema ownership privileges; and
+- readiness verifies both required and forbidden effective privileges, including inherited and `PUBLIC` grants.
+
+---
+
+## 13. Risks and open decisions
+
+### 13.1 Unresolved business semantics
+
+These are not schema guesses and remain open:
+
+1. Authoritative meanings of BVC `etatCotVal`/HTML status tokens including `T`, `N.T`, `S`, and variants.
+2. Whether `coursCourant` is a trade, reference, theoretical, previous, or display value in each status context.
+3. Whether current JSON/HTML OHLCV fields are session-to-date aggregates eligible for a provisional daily bar.
+4. Which source field/event proves official daily finalization and late official correction.
+5. Field-specific source authority ranks for symbol, ISIN, name, type, currency, activity, latest price, and daily bar.
+6. The stable BVC source-record identity used to distinguish same-source republication from cross-record conflict when no external row ID exists.
+7. Authoritative expected instrument coverage/count and when a short page proves complete collection.
+8. Trading calendar, market session, finalization SLA, and whether collection-received date fallback may ever advance latest data.
+9. Authoritative precision/scale and upper bounds beyond the conservative current six-decimal projection limits.
+
+Until answered, source statuses remain opaque, collection-date fallback is not production-eligible, daily-bar writes/publication stay disabled, and staleness remains unknown where policy is missing.
+
+### 13.2 High-risk migration areas
+
+- Refactoring a table that currently mixes raw content and collection/processing state while preserving all existing FKs and IDs.
+- Legacy data whose exact pre-charset bytes and collection attempts cannot be reconstructed.
+- Duplicate daily bars with different values/provenance.
+- Instrument key/name conflicts created by blind historical merge behavior.
+- Atomic publication across many projection rows under concurrent readers/writers.
+- Creating unique indexes on legacy data without first obtaining a consistent audit snapshot.
+- PostgreSQL numeric typmod rounding if exact scale is not validated before projection writes.
+- Sensitive legacy response headers already present in raw metadata.
+- Role/ownership mistakes that make a correctly shaped safe view irrelevant because the API can still read raw tables.
+- Alembic downgrade paths that would discard new audit events.
+
+### 13.3 Potentially overengineered ideas deliberately limited or deferred
+
+- A generic event framework: rejected; use explicit BVC collection/processing/publication tables.
+- Full immutable revision history for every instrument field: deferred; current field provenance plus raw/occurrence evidence is the minimal design.
+- Database triggers for all immutability and projection equality: deferred; begin with roles, repository APIs, constraints, and tests.
+- A database-stored readiness manifest: rejected; package it with the build.
+- Source-authority/EAV configuration tables: deferred until multiple sources/contracts require them.
+- Object storage for current small BVC payloads: deferred; initial design uses PostgreSQL `BYTEA`.
+- Full daily-history publication before price-snapshot automation: deferred; disable bar writes instead.
+- SLA/calendar tables and data-readiness gates: deferred until policies are authoritative.
+
+### 13.4 Decisions required before the first Alembic migration
+
+1. Approve retaining/refactoring `raw_payloads` in place rather than introducing a renamed `raw_contents` table.
+2. Approve PostgreSQL `BYTEA` as initial exact entity-body storage and the rule that legacy decoded text does not receive an exact-body hash.
+3. Approve the physical names in section 2 and the group-page `page_limit` composite-FK denormalization needed for a database-checkable offset formula.
+4. Approve unconstrained `NUMERIC` plus explicit scale/bound checks for immutable revisions while retaining fixed-scale compatibility projections.
+5. Approve transitional `legacy_unresolved`/`legacy_unverified` states and partial constraints instead of fabricating complete legacy evidence.
+6. Decide whether Phase A includes deferred daily revision tables or omits them until the daily business contract is approved. This plan recommends omission.
+7. Approve the audit-report storage/retention mechanism and who reviews blocking reconciliation items.
+
+### 13.5 Decisions required before publication/API activation
+
+1. Approve `latest_prices` as the atomic accepted projection/cache and `accepted_publication_pointers` as current-snapshot authority.
+2. Approve complete-scope behavior for an instrument absent from a new group. This plan prohibits silent carry-forward and requires proven coverage policy.
+3. Approve source adapter/record identity and all field/price authority values.
+4. Approve migration handling for any real instrument/daily/error conflict report; automatic selection is forbidden.
+5. Approve API, collector, migration-owner, and operator role names/grants plus the manifest canonicalization/signing format.
+6. Approve freshness/diagnostics response versioning strategy.
+7. Approve legacy unsafe-header isolation or a separate scrub operation before raw privilege hardening is declared complete.
+
+### 13.6 Decisions intentionally deferred
+
+- Daily provisional/final implementation and any accepted historical backfill.
+- External instrument-ID mapping table.
+- Full field-revision history.
+- Raw object-storage migration/retention tiering.
+- Operator error-ignore workflow and long-term observation retention.
+- Exact liveness/readiness route names beyond preserving `/health` as aggregate readiness.
+- Any destructive removal of legacy columns or unresolved records.
+
+### 13.7 Unverified assumptions
+
+- The re-entry report found an empty local PostgreSQL database on 2026-07-16, but this plan must also support other databases with legacy rows. Actual pre-migration audits remain mandatory.
+- Existing payload sizes appear suitable for PostgreSQL storage, but no retention/volume benchmark has yet proven long-term `BYTEA` cost.
+- PostgreSQL 16 is the Compose target; production version, UTF-8 encoding, collation, and role topology must be verified before using canonical string checks.
+- No current test proves Alembic upgrade, PostgreSQL concurrency, roles, or production data reconciliation.
+- Current source metadata may be insufficient to correlate every source record across pages/versions.
+
+---
+
+## 14. Recommended implementation missions
+
+### Mission 1 — Minimal PostgreSQL migration harness
+
+**Objective:** establish only the repeatable PostgreSQL 16 test foundation needed to apply Alembic from an empty database and open a representative `0001` database for later upgrade tests.
+
+**Files likely involved:** one focused PostgreSQL fixture/helper and one migration smoke-test module under `tests/`; `migrations/env.py` only if test-safe URL injection is demonstrably required. Avoid new dependencies if existing Psycopg/Compose is sufficient.
+
+**Schema/runtime scope:** no target domain migration and no collector/API behavior change. Synthetic legacy fixtures only.
+
+**Acceptance criteria:** an empty PostgreSQL database upgrades to current head; a representative current-`0001` database is reproducibly constructed and inspected; migration revision and expected current tables are asserted; failures are clearly distinguished from SQLite unit tests.
+
+**Out of scope:** the full section-7 audit suite, reconciliation, target tables, collector/API changes, publication, scheduler, and daily semantics. Each later schema mission adds the read-only audits relevant to the objects it changes before any backfill or constraint validation.
+
+### Mission 2 — Additive collection-audit schema
+
+**Objective:** add only the raw exact-content columns, run role/status fields, collection groups/pages/occurrences/selections, and processing-attempt foundation with transitional constraints.
+
+**Files likely involved:** relevant SQLAlchemy model modules, model exports/enums, one or more new Alembic revisions, and PostgreSQL migration/constraint tests.
+
+**Schema/runtime scope:** additive schema only; current collector/repositories remain unchanged.
+
+**Acceptance criteria:** fresh and `0001` upgrades pass; current rows/IDs/hashes are unchanged; every occurrence outcome shape and page ownership invariant has a named PostgreSQL test; downgrade limitations are documented.
+
+**Out of scope:** dual-write, instrument merge, price revisions, accepted publication, API, scheduler, daily tables.
+
+### Mission 3 — Raw-first occurrence dual-write
+
+**Objective:** make the BVC client/collector preserve exact bytes and every response/failure occurrence with safe headers before parsing, while retaining compatibility reads.
+
+**Files likely involved:** BVC client/fetch models, collector/fixture loader, hashing/header sanitizer, raw/occurrence repositories, configuration only if an explicitly approved request profile field is needed, and collector/PostgreSQL tests.
+
+**Schema/runtime scope:** target content/occurrence/group/page writes; no normalized-table behavior switch.
+
+**Acceptance criteria:** empty/malformed/unexpected/non-2xx/redirect/retry/no-response cases are preserved; duplicate bodies reuse content but add occurrences; concurrent deduplication converges; no denied/unknown headers or private URL values persist; no live tests.
+
+**Out of scope:** parsing/normalization changes beyond consuming stored bytes, instrument/price writes, publication, scheduler.
+
+### Mission 4 — Immutable processing and normalization-error identity
+
+**Objective:** persist versioned diagnostics/parser/normalizer attempts and implement the canonical logical-error key plus immutable observations and sequence-aware lifecycle.
+
+**Files likely involved:** processing/error models, Alembic revision, diagnostics/normalizer result models, error repository, runner transaction boundaries, and PostgreSQL concurrency tests.
+
+**Schema/runtime scope:** processing/error audit only; existing canonical instrument/price behavior remains temporarily compatible.
+
+**Acceptance criteria:** repeated/concurrent same-key errors converge; message changes do not duplicate; partial failures do not resolve; reprocessing creates attempts without fake occurrences; raw content rows are never mutated for processing status.
+
+**Out of scope:** field-aware instrument merge, accepted prices, API switch, scheduler, daily semantics.
+
+### Mission 5 — Deterministic instrument merge and provenance
+
+**Objective:** add canonical identity checks, first/last sightings, per-field current provenance, and deterministic name conflicts; replace blind `upsert_instrument` behavior.
+
+**Files likely involved:** instrument/provenance/conflict models, Alembic revision, parser intermediate fields, instrument repository, normalizer integration, and PostgreSQL race/order tests.
+
+**Schema/runtime scope:** instrument slice only.
+
+**Acceptance criteria:** weak/missing/older rows never erase stronger values; symbol/ISIN conflicts block; same-authority descriptive conflicts converge to the same placeholder/candidate set in any order; authentic sightings use min/max; source/raw/occurrence provenance moves as a tuple.
+
+**Out of scope:** lifecycle source implementation, automatic conflict resolution, price publication, scheduler, daily bars.
+
+### Mission 6 — Latest-price revision staging and atomic publication
+
+**Objective:** implement exact latest-price revisions, stale/equal/new ordering, group memberships, publication attempts, pointer locking, and one-transaction accepted projection refresh.
+
+**Files likely involved:** latest revision/membership/publication models, Alembic revisions, exact Decimal/fingerprint utilities, price/publication repositories, normalizer/runner staging, and PostgreSQL concurrency/fault tests.
+
+**Schema/runtime scope:** current BVC latest snapshot only. Add the hard gate that disables unverified daily-bar writes.
+
+**Acceptance criteria:** every document-16 ordering case is deterministic; equal identical values confirm without provenance churn; corrections preserve prior revision; partial groups never update public data; failed publication leaves the prior pointer/projection; concurrent readers never see a mixed group.
+
+**Out of scope:** scheduler, daily-bar revision/publication, SLA/calendar, public API freshness switch until the next mission.
+
+### Mission 7 — Safe API/readiness activation
+
+**Objective:** activate accepted-projection reads, versioned freshness/diagnostics, safe diagnostics view, least-privilege roles, and manifest-backed schema/application readiness.
+
+**Files likely involved:** BVC repository/API schemas/routes, health/readiness modules, view/grant Alembic revision, packaged schema manifest, and PostgreSQL API/role/readiness tests.
+
+**Schema/runtime scope:** read path and operational safety after Mission 6; no collection scheduling.
+
+**Acceptance criteria:** endpoints serve only accepted scope; freshness terms match document 16; schema absence/drift yields controlled 503; liveness is dependency-free; API role cannot read raw bodies/headers or write; view/constraint/grant signatures match the manifest.
+
+**Out of scope:** scheduler/workers, live collection validation, daily historical publication, new source/data type, SLA/calendar implementation.
+
+### Deferred follow-on — Daily-bar contract activation
+
+This is not one of the immediate missions. It begins only after authoritative BVC daily aggregate/finalization semantics, authority, precision, and correction rules are approved. It then implements daily revisions, memberships, duplicate reconciliation, accepted-final projection, and historical freshness tests. Until that point, BVC daily-bar writes remain disabled in any future automated pipeline.
+
+---
+
+## Conclusion
+
+The current foundation remains usable: stable exchange/source/instrument IDs, raw bodies, run envelopes, current projections, and API shapes can be preserved. It is not safe for unattended publication because raw content and occurrences are conflated, groups and processing attempts are not durable, instrument merge is destructive, latest prices publish page by page, daily identity is wrong, error identity is race-prone, and PostgreSQL invariants are untested.
+
+The safe target is additive first. Preserve every legacy fact, represent unknowns honestly, validate on PostgreSQL, and make one complete group publication transaction the only way to replace current BVC prices. Daily history should not hold up current-snapshot infrastructure, provided the legacy unverified bar path is explicitly disabled until its source semantics are known.

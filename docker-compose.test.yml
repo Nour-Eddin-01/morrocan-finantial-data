@@ -1,0 +1,29 @@
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_DB: tradehub_data_test
+      POSTGRES_USER: tradehub_data_test
+      POSTGRES_PASSWORD: tradehub_data_test
+    ports:
+      - "127.0.0.1:${POSTGRES_TEST_PORT:-55432}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradehub_data_test -d tradehub_data_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    stop_grace_period: 5s
+
+  migration-tests:
+    build: .
+    profiles: ["test-runner"]
+    environment:
+      TRADEHUB_DATA_TEST_DATABASE_URL: postgresql+psycopg://tradehub_data_test:tradehub_data_test@postgres-test:5432/tradehub_data_test
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    command: ["sh", "-c", "pip install -e '.[dev]' && pytest -m postgres"]

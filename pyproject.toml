@@ -33,3 +33,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "postgres: tests that require an explicitly configured isolated PostgreSQL test database",
+]

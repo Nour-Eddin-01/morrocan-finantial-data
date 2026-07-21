@@ -1,17 +1,39 @@
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
-class BvcFetchResult(BaseModel):
-    source_url: str
-    http_status: int
-    content_type: str | None
-    body_text: str
-    fetched_at: datetime
-    headers: dict[str, str] = Field(default_factory=dict)
+@dataclass(frozen=True, slots=True)
+class BvcHttpResponseEvidence:
+    """One fully received client-visible HTTP response, before text decoding."""
+
+    requested_at: datetime
+    response_received_at: datetime
+    finished_at: datetime
+    requested_url: str = field(repr=False)
+    response_url: str = field(repr=False)
+    status_code: int
+    entity_body: bytes = field(repr=False)
+    response_header_items: tuple[tuple[str, str], ...] = field(repr=False)
+    content_type: str | None = field(repr=False)
+    redirect_location: str | None = field(default=None, repr=False)
+    source_published_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BvcTransportFailureEvidence:
+    """A bounded no-response transport outcome safe for audit persistence."""
+
+    requested_at: datetime
+    finished_at: datetime
+    safe_error_code: str
+    safe_error_message: str
+
+
+BvcFetchAttemptResult = BvcHttpResponseEvidence | BvcTransportFailureEvidence
 
 
 class BvcPriceCollectorResult(BaseModel):
@@ -22,4 +44,3 @@ class BvcPriceCollectorResult(BaseModel):
     payloads_skipped: int
     errors_count: int
     message: str | None = None
-

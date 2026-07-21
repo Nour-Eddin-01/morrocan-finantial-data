@@ -47,12 +47,16 @@ def create_ingestion_run(
     collector_name: str,
     run_type: str,
     started_at: datetime,
+    run_role: str = "legacy_unclassified",
+    parent_run_id=None,
     metadata: dict[str, Any] | None = None,
 ) -> IngestionRun:
     run = IngestionRun(
         source_id=source_id,
         collector_name=collector_name,
         run_type=run_type,
+        run_role=run_role,
+        parent_run_id=parent_run_id,
         status="running",
         started_at=started_at,
         metadata_=metadata,
@@ -72,6 +76,7 @@ def finish_ingestion_run(
     records_inserted: int | None = None,
     records_updated: int | None = None,
     records_failed: int | None = None,
+    safe_error_code: str | None = None,
     error_message: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> IngestionRun:
@@ -85,6 +90,7 @@ def finish_ingestion_run(
         run.records_updated = records_updated
     if records_failed is not None:
         run.records_failed = records_failed
+    run.safe_error_code = safe_error_code
     run.error_message = error_message
     if metadata is not None:
         run.metadata_ = metadata
